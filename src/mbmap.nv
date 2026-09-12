@@ -1,0 +1,397 @@
+// mbmap.nv — the server side: four address spaces as a value, and one
+// trait for what is behind them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A MODBUS SERVER IS AN ADDRESS MAP AND A HANDLER, and separating them
+// is what lets one gateway serve an RS-485 line and a TCP socket from
+// the same configuration.  `MbRegMap` is which ranges exist — four
+// base-and-count pairs, eight integers, a `@value` struct a firmware
+// holds in flash.  `MbHandler[e]` is what reads and writes them, and
+// its effect row is the device's: `[hw]` for a driver reading an ADC,
+// `[fs]` for a simulator over a file, and NOTHING for a table in a
+// test.
+//
+// FOUR SPACES THAT OVERLAP IN EVERY REAL DEVICE.  Modbus defines coils
+// (writable bits), discrete inputs (read-only bits), holding registers
+// (writable words) and input registers (read-only words), each with
+// its own address space starting at 0.  Nearly every real device
+// aliases them — the same measurement readable as an input register
+// and a holding register — and the specification neither requires nor
+// forbids it.  So `MbRegMap` describes what EXISTS rather than what is
+// distinct, and `covers` is the question a server asks before it calls
+// a handler.
+//
+// THE RANGE CHECK IS HERE AND NOT IN THE HANDLER, on purpose.  A
+// handler that had to range-check would range-check differently in
+// four places and one of them would have the off-by-one — which is
+// exactly the bug whose symptom is exception 2 on the last address of
+// a valid range.  `covers` is written once, `mbpdu.req_last` is the
+// arithmetic it uses, and a handler is called only for a range that
+// exists.
+//
+// ADDRESSES ARE WIRE ADDRESSES.  Address 0 in this module is the coil
+// a device's manual calls 000001 and a configuration screen calls 1.
+// The package does not convert, because the convention differs per
+// vendor and a library that guessed would be wrong for half its
+// users — but `wire_from_manual` is here so a caller converting has a
+// named place to do it rather than a `- 1` somewhere in its own code.
+
+use mbpdu
+
+// ── The four spaces ──────────────────────────────────────────────────
+
+// Coils: writable single bits.  Function codes 1, 5 and 15.
+pub const MB_SPACE_COIL = 0
+// Discrete inputs: read-only single bits.  Function code 2.
+pub const MB_SPACE_DISCRETE = 1
+// Holding registers: writable sixteen-bit words.  Function codes 3, 6,
+// 16 and 23.
+pub const MB_SPACE_HOLDING = 2
+// Input registers: read-only sixteen-bit words.  Function code 4.
+pub const MB_SPACE_INPUT = 3
+
+// The highest address any space can have: 65535.
+pub const MB_MAX_ADDRESS = 65535
+
+// Which space a function code addresses.
+//
+// ```novo
+// use mbmap
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbmap.space_of(mbpdu.MB_FC_READ_INPUT)}")   // 3
+// ```
+pub fn space_of(fc: Int) -> Int []
+    todo("modbus-nv.mbmap.space_of")
+
+// Which space a function code's WRITE half addresses, for function
+// 23.
+//
+// Its own function because 23 reads holding registers and writes
+// holding registers at a different address, so one answer cannot serve
+// both halves.
+pub fn write_space_of(fc: Int) -> Int []
+    todo("modbus-nv.mbmap.write_space_of")
+
+// A space in words.
+pub fn space_name(space: Int) -> Str []
+    todo("modbus-nv.mbmap.space_name")
+
+// Whether a space holds bits rather than words.
+pub fn space_is_bits(space: Int) -> Bool []
+    todo("modbus-nv.mbmap.space_is_bits")
+
+// Whether a space may be written.
+//
+// Discrete inputs and input registers may not, which is not a policy a
+// device chooses: there is no function code that writes them.  A
+// server that accepted a write to one has accepted a request nothing
+// could have sent.
+pub fn space_is_writable(space: Int) -> Bool []
+    todo("modbus-nv.mbmap.space_is_writable")
+
+// ── The map ──────────────────────────────────────────────────────────
+
+// Which addresses exist, in each of the four spaces.
+//
+// Eight integers — a base and a count per space — so a firmware holds
+// the whole thing in flash and a server's range check is arithmetic
+// rather than a lookup.  A count of 0 means the space does not exist
+// on this device, which is the ordinary case for at least two of the
+// four.
+pub @value
+struct MbRegMap
+    // The first coil address.
+    coil_base: Int
+    // How many coils.
+    coil_count: Int
+    // The first discrete input address.
+    discrete_base: Int
+    // How many discrete inputs.
+    discrete_count: Int
+    // The first holding register address.
+    holding_base: Int
+    // How many holding registers.
+    holding_count: Int
+    // The first input register address.
+    input_base: Int
+    // How many input registers.
+    input_count: Int
+
+// Build a map.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     let m = mbmap.reg_map(0, 8, 0, 16, 0, 64, 0, 32)
+//     println("${mbmap.space_count(m, mbmap.MB_SPACE_HOLDING)}")   // 64
+// ```
+pub fn reg_map(coil_base: Int, coil_count: Int, discrete_base: Int, discrete_count: Int,
+               holding_base: Int, holding_count: Int, input_base: Int,
+               input_count: Int) -> MbRegMap []
+    todo("modbus-nv.mbmap.reg_map")
+
+// A map with only holding registers, which is what most devices
+// actually are.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     println("${mbmap.space_count(mbmap.holding_only(0, 64), mbmap.MB_SPACE_COIL)}")
+// ```
+pub fn holding_only(base: Int, count: Int) -> MbRegMap []
+    todo("modbus-nv.mbmap.holding_only")
+
+// A map with nothing in it, which refuses everything.
+//
+// The safe default: a server built from this answers exception 2 to
+// every request, rather than handing back whatever a handler has
+// lying around for an address nobody ever configured.
+pub fn empty_map() -> MbRegMap []
+    todo("modbus-nv.mbmap.empty_map")
+
+// The first address of a space.
+pub fn space_base(m: MbRegMap, space: Int) -> Int []
+    todo("modbus-nv.mbmap.space_base")
+
+// How many addresses a space has, or 0 when it does not exist here.
+pub fn space_count(m: MbRegMap, space: Int) -> Int []
+    todo("modbus-nv.mbmap.space_count")
+
+// The last address of a space, or -1 when it does not exist.
+pub fn space_last(m: MbRegMap, space: Int) -> Int []
+    todo("modbus-nv.mbmap.space_last")
+
+// Whether a space exists on this device at all.
+pub fn space_exists(m: MbRegMap, space: Int) -> Bool []
+    todo("modbus-nv.mbmap.space_exists")
+
+// The same map with one space replaced.
+pub fn with_space(m: MbRegMap, space: Int, base: Int, count: Int) -> MbRegMap []
+    todo("modbus-nv.mbmap.with_space")
+
+// ── The range check ──────────────────────────────────────────────────
+
+// Whether the whole range `start` to `start + count - 1` exists in
+// this space.
+//
+// THE WHOLE RANGE, not its first address.  Modbus has no partial
+// answer: a read that runs off the end of a map is refused entirely
+// with exception 2, and a server that returned what it had would hand
+// its client zeros indistinguishable from real measurements.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     let m = mbmap.holding_only(0, 64)
+//     println("${mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 60, 4)}")   // true
+//     println("${mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 60, 8)}")   // false
+// ```
+pub fn covers(m: MbRegMap, space: Int, start: Int, count: Int) -> Bool []
+    todo("modbus-nv.mbmap.covers")
+
+// Whether this map can serve this request, both halves of function 23
+// included.
+//
+// The one call a server makes before it dispatches, so that a handler
+// is never asked for an address that does not exist and never has to
+// range-check for itself — which is the check that would be written
+// four times with the off-by-one in one of them.
+//
+// ```novo
+// use mbmap
+// use mbpdu
+//
+// fn main() [io]
+//     let m = mbmap.holding_only(0, 64)
+//     println("${mbmap.serves(m, mbpdu.read_req(3, 0, 10))}")   // true
+// ```
+pub fn serves(m: MbRegMap, q: MbReq) -> Bool []
+    todo("modbus-nv.mbmap.serves")
+
+// The exception code this map would answer this request with, or 0
+// when it can serve it.
+//
+// Exception 2 for a range that does not exist, exception 1 for a
+// function whose space this device does not have at all.  The
+// distinction is worth drawing: "this address does not exist" sends a
+// client to its configuration and "this device does not do coils" sends
+// it to the manual.
+pub fn exception_for(m: MbRegMap, q: MbReq) -> Int []
+    todo("modbus-nv.mbmap.exception_for")
+
+// Why this map cannot serve this request, or nothing.
+pub fn check_serves(m: MbRegMap, q: MbReq) -> ?MbError []
+    todo("modbus-nv.mbmap.check_serves")
+
+// The offset of `address` from a space's base, or -1 when it is
+// outside.
+//
+// What a handler indexes its own storage with: a device whose holding
+// registers start at 40000 on the wire has them at 0 in its array, and
+// doing that subtraction here rather than in the handler is what stops
+// it being done twice or not at all.
+pub fn offset_in(m: MbRegMap, space: Int, address: Int) -> Int []
+    todo("modbus-nv.mbmap.offset_in")
+
+// ── The handler ──────────────────────────────────────────────────────
+
+// What is behind the addresses.
+//
+// `e` is the effect row the implementation supplies, and it is what
+// every server function costs: `[hw]` for a driver reading an ADC,
+// `[fs]` for a simulator over a file, `[mutate]` for an in-memory
+// table, and NOTHING for a table in a test.  A server written over
+// this trait is charged what its handler costs and not a byte more —
+// which is what lets the whole of a gateway's request handling be
+// tested with no device attached.
+//
+// EVERY METHOD IS CALLED WITH A RANGE THAT EXISTS.  `mbmap.serves` has
+// already said so, so a handler does no range checking and cannot get
+// the off-by-one wrong.
+pub trait MbHandler[e]
+    // Read `count` coils from `address`.  The answer is the bits
+    // packed eight to a byte, least significant bit first — which is
+    // the protocol's own order and the opposite of how a person writes
+    // a bit pattern down.
+    fn mb_read_coils(self, address: Int, count: Int) -> Result<Bytes, MbError> [e]
+    // Read `count` discrete inputs.
+    fn mb_read_discrete(self, address: Int, count: Int) -> Result<Bytes, MbError> [e]
+    // Read `count` holding registers.  The answer is two bytes per
+    // register, big-endian.
+    fn mb_read_holding(self, address: Int, count: Int) -> Result<Bytes, MbError> [e]
+    // Read `count` input registers.
+    fn mb_read_input(self, address: Int, count: Int) -> Result<Bytes, MbError> [e]
+    // Write `count` coils from packed bits.
+    fn mb_write_coils(self, address: Int, count: Int, data: Bytes) -> ?MbError [e]
+    // Write `count` holding registers from big-endian words.
+    fn mb_write_holding(self, address: Int, count: Int, data: Bytes) -> ?MbError [e]
+    // Whether the device is too busy to answer right now.
+    //
+    // The one method with no effect row, and the one that makes
+    // exception 6 possible: a device performing a long command must be
+    // able to say so, and a question that cost `[hw]` to ask is a
+    // question a server would skip.
+    fn mb_is_busy(self) -> Bool
+
+// Serve one request against a map and a handler.
+//
+// `[e]` — the cost is the handler's.  The answer is the response's
+// data bytes; the response header is `mbpdu`'s and the framing is
+// `mbrtu`'s or `mbtcp`'s, so this one function is the whole of a
+// server's protocol handling and none of its transport.
+pub fn serve<H: MbHandler[e]>(h: H, m: MbRegMap, q: MbReq) -> Result<Bytes, MbError> [e]
+    todo("modbus-nv.mbmap.serve")
+
+// The response header `serve`'s answer belongs in.
+//
+// Separate from `serve` because a `@value` struct cannot be part of a
+// `Result` (E2015), so one call cannot answer both the header and the
+// bytes — the same constraint every other fallible pair in this
+// package meets.
+//
+// ```novo
+// use mbmap
+// use mbpdu
+//
+// fn main() [io]
+//     let m = mbmap.holding_only(0, 64)
+//     let r = mbmap.response_for(m, mbpdu.read_req(3, 0, 10))
+//     println("${mbpdu.rsp_byte_count(r)}")   // 20
+// ```
+pub fn response_for(m: MbRegMap, q: MbReq) -> MbRsp []
+    todo("modbus-nv.mbmap.response_for")
+
+// Whether a busy handler should answer exception 6 to this request.
+//
+// A READ from a busy device is usually still answerable and a WRITE
+// usually is not, which is a policy rather than a rule — so it is a
+// named function a server can ignore rather than behaviour buried in
+// `serve`.
+pub fn busy_refuses(q: MbReq) -> Bool []
+    todo("modbus-nv.mbmap.busy_refuses")
+
+// ── Packing what a handler answers ───────────────────────────────────
+
+// How many bytes `count` bits occupy: `count` divided by eight,
+// rounded up.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     println("${mbmap.bits_to_bytes(9)}")   // 2
+// ```
+pub fn bits_to_bytes(count: Int) -> Int []
+    todo("modbus-nv.mbmap.bits_to_bytes")
+
+// How many bytes `count` registers occupy: twice `count`.
+pub fn regs_to_bytes(count: Int) -> Int []
+    todo("modbus-nv.mbmap.regs_to_bytes")
+
+// Which byte of a packed bit run holds bit `i`.
+pub fn bit_byte_index(i: Int) -> Int []
+    todo("modbus-nv.mbmap.bit_byte_index")
+
+// Which bit of that byte, counted from the LEAST significant.
+//
+// The protocol's own order, and the opposite of how a person writes a
+// bit pattern down — so the first coil of a read is bit 0 of byte 0,
+// and an implementation that packed them the readable way produces
+// coils that are reversed in groups of eight.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     println("${mbmap.bit_in_byte(0)}")   // 0
+//     println("${mbmap.bit_in_byte(8)}")   // 0
+// ```
+pub fn bit_in_byte(i: Int) -> Int []
+    todo("modbus-nv.mbmap.bit_in_byte")
+
+// The high byte of a register value, which goes out first.
+pub fn reg_high_byte(value: Int) -> Int []
+    todo("modbus-nv.mbmap.reg_high_byte")
+
+// The low byte, which goes out second.
+pub fn reg_low_byte(value: Int) -> Int []
+    todo("modbus-nv.mbmap.reg_low_byte")
+
+// The register value at `i` inside a big-endian run of bytes.
+pub fn reg_at(data: Bytes, i: Int) -> Int []
+    todo("modbus-nv.mbmap.reg_at")
+
+// Whether bit `i` is set inside a packed run of bytes.
+pub fn bit_at(data: Bytes, i: Int) -> Bool []
+    todo("modbus-nv.mbmap.bit_at")
+
+// ── Wire addresses and manual addresses ──────────────────────────────
+
+// The wire address for the number in a device's manual.
+//
+// Manuals and configuration screens count from 1 and the wire counts
+// from 0, and vendors differ about whether the leading digit — the
+// 4 in 40001 — is part of the number or a space marker.  This package
+// does not guess: it converts what a caller says it has, and having a
+// named function is what stops a `- 1` appearing somewhere in a
+// caller's own code where nobody can find it.
+//
+// ```novo
+// use mbmap
+//
+// fn main() [io]
+//     println("${mbmap.wire_from_manual(40001, true)}")   // 0
+//     println("${mbmap.wire_from_manual(1, false)}")      // 0
+// ```
+pub fn wire_from_manual(manual: Int, has_space_prefix: Bool) -> Int []
+    todo("modbus-nv.mbmap.wire_from_manual")
+
+// The manual's number for a wire address.
+pub fn manual_from_wire(address: Int, space: Int, has_space_prefix: Bool) -> Int []
+    todo("modbus-nv.mbmap.manual_from_wire")

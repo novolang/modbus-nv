@@ -1,0 +1,130 @@
+// mberr.nv — the TRANSPORT faults, and nothing else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE VARIANT THAT IS NOT HERE IS THE POINT OF THE TYPE.  There is no
+// `MbException` in this enum, and there will not be one.  A Modbus
+// exception is a SUCCESSFUL EXCHANGE: the server received the request,
+// understood it, and refused it with a code saying why.  That belongs
+// on the response — `mbpdu.MbRsp`'s `exception` field — because it is
+// an answer.  What is here is the other kind: nobody answered, or what
+// came back was not an answer.
+//
+// The two carry opposite instructions and conflating them is the
+// commonest Modbus bug in any language.  A client that turns exception
+// 2 into a transport error retries forever against a device that will
+// never say anything else.  A gateway that does the same cannot
+// forward the refusal and invents a timeout its own client then
+// retries.  A `Result<MbRsp, MbError>` where an exception is a `Result`
+// error makes both of those the natural thing to write.
+//
+// Every variant is prefixed `Mb`, because a variant is constructed by
+// name rather than by the type the expression expects: an unprefixed
+// `Timeout` or `BadCrc` in this package would bind whichever package's
+// variant of that name the assembly declared first.
+
+// What went wrong on the way, as against what the server said.
+pub enum MbError
+    // Nobody answered inside the deadline.
+    MbTimedOut(ms: Int)
+    // The frame's check value does not match what arrived.  RTU only:
+    // TCP has no CRC, because the stream is checksummed already.
+    MbBadCrc(want: Int, have: Int)
+    // A frame ended before its own length said it would.
+    MbShortFrame(want: Int, have: Int)
+    // A frame claims to be longer than the protocol allows.
+    MbFrameTooLong(len: Int)
+    // A reply's function code does not answer the request's.
+    MbWrongFunction(want: Int, found: Int)
+    // A reply carries a different number of data bytes than the
+    // request implies.  The check that catches a device answering the
+    // wrong function's data, which otherwise reads as plausible
+    // numbers.
+    MbByteCountMismatch(want: Int, found: Int)
+    // A reply's transaction or unit identifier does not answer the
+    // request's.  TCP only, and the fault a client that assumed
+    // replies come back in order never notices.
+    MbWrongTransaction(want: Int, found: Int)
+    // A reply came from a different unit address than the one asked.
+    MbWrongUnit(want: Int, found: Int)
+    // The MBAP protocol identifier is not 0, so whatever arrived on
+    // port 502 is not Modbus.
+    MbNotModbus(protocol: Int)
+    // A request asks for more units than its function code allows.
+    // Refused before it is sent, because a conforming server answers
+    // exception 3 and the round trip is wasted.
+    MbCountTooLarge(fc: Int, count: Int, limit: Int)
+    // An address is above 65535, which is not addressable at all.
+    MbAddressTooLarge(address: Int)
+    // A function code this package does not implement.
+    MbUnsupportedFunction(fc: Int)
+    // A single-coil write carries a value that is neither 0xFF00 nor
+    // 0x0000, which a device is required to refuse.
+    MbBadCoilValue(value: Int)
+    // A unit address outside 1 to 247, or 0 where a broadcast is not
+    // allowed.
+    MbBadUnitAddress(address: Int)
+    // A client waited for a reply to a broadcast, which never comes.
+    // Worth its own variant because the answer is a code change rather
+    // than a longer timeout.
+    MbBroadcastHasNoReply
+    // The socket refused, closed, or could not be opened.
+    MbTransportFailed(detail: Str)
+    // A handler's address map does not cover the range asked for.  The
+    // SERVER-side counterpart of what a client sees as exception 2.
+    MbNotInMap(start: Int, count: Int)
+
+// The one-line report: what went wrong on the way, and the numbers
+// that decided it.
+//
+// `Result<_, MbError>` requires this impl: SPEC § 3.4 admits a
+// `Result` error type only if it implements `Error`.
+//
+// ```novo
+// use mberr
+//
+// fn main() [io]
+//     println(mberr.describe(MbBroadcastHasNoReply))
+// ```
+impl Error for MbError
+    fn message(self) -> Str
+        todo("modbus-nv.mberr.MbError.message")
+
+// The same sentence as `message`, as a free function, for a caller
+// that has an error value rather than a `Result` to call `.message()`
+// on.
+//
+// ```novo
+// use mberr
+//
+// fn main() [io]
+//     println(mberr.describe(MbTimedOut(1000)))
+// ```
+pub fn describe(e: MbError) -> Str []
+    todo("modbus-nv.mberr.describe")
+
+// Whether sending the same request again could work.
+//
+// A timeout and a bad check value are worth another try; a count past
+// its function's limit and an unsupported function code are not, and a
+// poll loop that retried those would spend its life on a request that
+// was always going to be refused.
+//
+// ```novo
+// use mberr
+//
+// fn main() [io]
+//     println("${mberr.is_retryable(MbTimedOut(1000))}")   // true
+// ```
+pub fn is_retryable(e: MbError) -> Bool []
+    todo("modbus-nv.mberr.is_retryable")
+
+// Whether the fault was found BEFORE the request went on the wire.
+//
+// The distinction a poll loop wants in its statistics: a request this
+// client refused to send is a programming mistake, and a request that
+// went out and was not answered is a line or a device problem.  Mixing
+// them in one counter makes a bad cable and a bad address look the
+// same.
+pub fn is_local(e: MbError) -> Bool []
+    todo("modbus-nv.mberr.is_local")

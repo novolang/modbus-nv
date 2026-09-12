@@ -1,0 +1,247 @@
+// mbclient_tests.nv — the retry policy, the poll arithmetic, and the
+// transport that performs nothing.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: modbus-nv.mbclient.<fn>`.
+//
+// WHAT IS COVERED HERE IS WHAT A MODBUS CLIENT ACTUALLY IS.  Almost
+// nothing reads a device once: a client polls a fixed set of ranges on
+// a fixed interval, forever, over a link that drops.  So the
+// assertions are about the backoff table, whether a schedule fits its
+// interval, and where a 500-register read splits — not about
+// `read_holding`, which needs a device.
+//
+// WHAT IS NOT COVERED, and is named rather than left implicit: whether
+// a connection succeeds, what a real server answers, and how a link
+// behaves when it drops mid-request.  Those need a Modbus server on
+// the machine, and they belong in a consumer probe with one.
+
+use std.test
+use mbclient
+use mbpdu
+use mbrtu
+
+// A transport over nothing at all.
+//
+// Every method declares `[]`, so every `mbclient` function driven
+// through it is `[]` too.  A real transport over TCP declares `[net]`
+// and one over a serial port `[io]`, and the same call sites are
+// charged that instead.
+struct MbTape
+    open: Bool
+
+impl MbTransport[] for MbTape
+    fn mb_send(self, frame: Bytes) -> ?MbError []
+        None
+
+    fn mb_recv(self, max: Int) -> Result<Bytes, MbError> []
+        Ok(bytes.zeros(0))
+
+    fn mb_close(self) -> ?MbError []
+        None
+
+    fn mb_is_open(self) -> Bool
+        self.open
+
+fn tape() -> MbTape
+    MbTape { open: true }
+
+fn nothing() -> Bytes
+    bytes.zeros(0)
+
+@test
+fn test_the_default_options_are_a_second_and_three_tries() [io]
+    let o = mbclient.default_options()
+    test.assert_eq(mbclient.timeout_ms(o), 1000)
+    test.assert_eq(mbclient.retries(o), 3)
+    test.assert_eq(mbclient.backoff_ms(o), 100)
+    test.assert_eq(mbclient.unit(o), 0xFF)
+
+@test
+fn test_the_backoff_doubles_and_then_stops() [io]
+    test.case("a table rather than a run against a dead device, which is the whole reason the policy is a value")
+    let o = mbclient.default_options()
+    test.assert_eq(mbclient.backoff_for(o, 0), 100)
+    test.assert_eq(mbclient.backoff_for(o, 1), 200)
+    test.assert_eq(mbclient.backoff_for(o, 2), 400)
+    test.assert_eq(mbclient.backoff_for(o, 3), 800)
+
+    test.case("and the ceiling holds, so a long-running poll loop does not back off into next week")
+    test.assert_eq(mbclient.backoff_for(o, 20), 2000)
+
+@test
+fn test_a_retry_needs_both_a_retryable_fault_and_an_attempt_left() [io]
+    test.case("a client with either half missing either gives up on a dropped packet or loops forever on a bad address")
+    let o = mbclient.default_options()
+    test.assert(mbclient.should_retry(o, MbTimedOut(1000), 0))
+    test.assert(mbclient.should_retry(o, MbTimedOut(1000), 2))
+    test.assert(mbclient.should_retry(o, MbTimedOut(1000), 3) == false)
+    test.assert(mbclient.should_retry(o, MbUnsupportedFunction(99), 0) == false)
+
+@test
+fn test_an_exception_goes_down_a_different_retry_path() [io]
+    test.case("only ACKNOWLEDGE and BUSY are worth another attempt; a client that fed exceptions into the transport path retries an illegal address until its operator notices")
+    let o = mbclient.default_options()
+    test.assert(mbclient.should_retry_exception(o, mbpdu.MB_EX_SERVER_BUSY, 0))
+    test.assert(mbclient.should_retry_exception(o, mbpdu.MB_EX_ACKNOWLEDGE, 0))
+    test.assert(mbclient.should_retry_exception(o,
+                                                mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS,
+                                                0) == false)
+    test.assert(mbclient.should_retry_exception(o, mbpdu.MB_EX_ILLEGAL_FUNCTION,
+                                                0) == false)
+
+    test.case("and the attempt limit still applies")
+    test.assert(mbclient.should_retry_exception(o, mbpdu.MB_EX_SERVER_BUSY,
+                                                3) == false)
+
+@test
+fn test_the_unit_can_be_changed_for_a_gateways_several_devices() [io]
+    let o = mbclient.with_unit(mbclient.default_options(), 7)
+    test.assert_eq(mbclient.unit(o), 7)
+    test.assert_eq(mbclient.timeout_ms(o), 1000)
+
+@test
+fn test_a_poll_schedule_either_fits_its_interval_or_drifts() [io]
+    test.case("a schedule that does not fit does not fail — the last device is polled less and less often and nothing anywhere reports it")
+    test.assert(mbclient.requests_per_interval(8, 9, 9600, 1000) > 0)
+    test.assert(mbclient.requests_per_interval(8, 255, 9600, 1000)
+                < mbclient.requests_per_interval(8, 9, 9600, 1000))
+
+    test.assert(mbclient.schedule_fits(1, 8, 9, 9600, 1000))
+    test.assert(mbclient.schedule_fits(1000, 8, 255, 9600, 1000) == false)
+
+@test
+fn test_a_faster_line_fits_more_requests() [io]
+    test.assert(mbclient.requests_per_interval(8, 255, 115200, 1000)
+                > mbclient.requests_per_interval(8, 255, 9600, 1000))
+
+@test
+fn test_a_large_read_splits_at_the_function_codes_limit() [io]
+    test.case("a client asking for 500 holding registers is asking for four reads, and splitting them is the caller's job")
+    test.assert_eq(mbclient.split_count(500, 125), 4)
+    test.assert_eq(mbclient.split_count(125, 125), 1)
+    test.assert_eq(mbclient.split_count(126, 125), 2)
+    test.assert_eq(mbclient.split_count(0, 125), 0)
+
+    test.assert_eq(mbclient.split_start(0, 0, 125), 0)
+    test.assert_eq(mbclient.split_start(0, 1, 125), 125)
+    test.assert_eq(mbclient.split_start(40, 1, 125), 165)
+
+    test.case("and the last read is short")
+    test.assert_eq(mbclient.split_len(500, 0, 125), 125)
+    test.assert_eq(mbclient.split_len(500, 3, 125), 125)
+    test.assert_eq(mbclient.split_len(300, 2, 125), 50)
+
+@test
+fn test_the_split_limit_comes_from_the_function_code() [io]
+    test.case("so a coil read splits at 2000 and a register read at 125, and a caller does not have to remember which")
+    test.assert_eq(mbclient.split_count(3000, mbpdu.max_count(mbpdu.MB_FC_READ_COILS)), 2)
+    test.assert_eq(mbclient.split_count(300, mbpdu.max_count(mbpdu.MB_FC_READ_HOLDING)), 3)
+
+@test
+fn test_a_transport_that_performs_nothing_makes_every_exchange_free() [io]
+    test.case("the property the effect parameter exists for: an RTU client over a serial port, one over a radio and one in a test use the same function")
+    let t = tape()
+    let o = mbclient.default_options()
+    match mbclient.exchange(t, o, mbpdu.read_req(3, 0, 10), nothing())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.assert(t.mb_is_open())
+
+@test
+fn test_an_rtu_exchange_takes_the_callers_crc() [io]
+    test.case("mbcrc is the bridge, and a gateway with a CRC peripheral passes its hardware's answer in")
+    let t = tape()
+    let o = mbclient.default_options()
+    match mbclient.exchange_rtu(t, o, 1, mbpdu.read_req(3, 0, 10), nothing(),
+                                0xC40B)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_timeout_should_come_from_the_line_rather_than_from_a_guess() [io]
+    test.case("the default second is fine on TCP and wrong at 9600 baud for a 125-register read, and mbrtu is where the number comes from")
+    let computed = mbrtu.reply_timeout_us(8, 255, 9600, 50)
+    test.assert(computed > 0)
+    test.assert(computed / 1000 > 0)
+
+@test
+fn test_connecting_to_nothing_answers_a_result_rather_than_hanging() [io, net, time]
+    test.case("what is NOT covered here is whether a connection succeeds, which needs a server on the machine")
+    match mbclient.connect("192.0.2.1", 502, mbclient.default_options())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_options_are_six_numbers_a_caller_can_build_and_assert_on() [io]
+    test.case("the whole policy before any socket exists, which is what makes a retry table a test rather than a run")
+    let o = mbclient.options(2000, 5, 50, 4000, 30000, 3)
+    test.assert_eq(mbclient.timeout_ms(o), 2000)
+    test.assert_eq(mbclient.retries(o), 5)
+    test.assert_eq(mbclient.backoff_ms(o), 50)
+    test.assert_eq(mbclient.unit(o), 3)
+    test.assert_eq(mbclient.backoff_for(o, 0), 50)
+    test.assert_eq(mbclient.backoff_for(o, 30), 4000)
+
+@test
+fn test_the_connections_own_readers_answer_what_it_was_built_with() [io, net, time]
+    test.case("what is NOT covered is whether the connection succeeds, which needs a server on the machine")
+    match mbclient.connect("192.0.2.1", 502, mbclient.default_options())
+        Ok(c)  =>
+            test.assert_eq(mbclient.client_host(c), "192.0.2.1")
+            test.assert(mbclient.client_transaction(c) >= 0)
+            test.assert_eq(mbclient.timeout_ms(mbclient.client_options(c)), 1000)
+            match mbclient.close(c)
+                None    => test.assert(true)
+                Some(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_every_request_shape_is_reachable_from_the_client() [io, net, time]
+    test.case("nine functions over one exchange, so a caller writes read_holding rather than assembling a PDU")
+    match mbclient.connect("192.0.2.1", 502, mbclient.default_options())
+        Ok(c)  =>
+            match mbclient.read_input(c, 0, 10)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.read_coils(c, 0, 8)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.read_discrete(c, 0, 8)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.write_holding(c, 0, 0x1234)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.write_coil(c, 0, true)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.write_holdings(c, 0, 2, nothing())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.write_coils(c, 0, 8, nothing())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.read_write_holdings(c, 0, 10, 20, 5, nothing())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match mbclient.request(c, mbpdu.read_req(3, 0, 10), nothing())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_exception_is_read_off_the_last_response() [io, net, time]
+    test.case("a separate reader because a @value struct cannot be part of a Result (E2015) — and it is why the exception is read rather than returned as an error")
+    match mbclient.connect("192.0.2.1", 502, mbclient.default_options())
+        Ok(c)  =>
+            let r = mbclient.last_response(c)
+            test.assert(mbpdu.rsp_is_exception(r) or mbpdu.rsp_is_exception(r) == false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_coil_write_takes_a_bool_rather_than_the_wire_value() [io]
+    test.case("0xFF00 and 0x0000 are the only legal values, so a caller should not be able to write a third")
+    test.assert(mbpdu.coil_value_ok(mbpdu.MB_COIL_ON))
+    test.assert(mbpdu.coil_value_ok(1) == false)

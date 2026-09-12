@@ -1,0 +1,80 @@
+// mbcrc.nv — the one line that reaches crc-nv.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A WHOLE MODULE FOR FIVE FUNCTIONS, for a reason about where a
+// dependency is NAMED rather than about what it does.  Every other
+// module in this package takes a CRC as an `Int` the caller supplies,
+// which buys two things: a gateway whose microcontroller has a CRC
+// peripheral passes its hardware's answer in and never walks a table,
+// and `tests/embedded_probe.nv`'s module closure stays inside this
+// package's own sources.  This module is where the dependency lives so
+// that the others do not have to.
+//
+// **crc-nv CARRIES THIS EXACT ALGORITHM BY NAME.**  `crc16_modbus()`
+// is polynomial 0x8005 reflected, initialised to 0xffff, with no final
+// xor — which is the variant and not a variant, and the number that
+// says so is its published check value over the nine bytes
+// `123456789`: 0x4b37.  A CRC that disagrees with another
+// implementation's is almost always the wrong variant rather than a
+// wrong implementation, and that is the number that tells them apart.
+// Writing a second copy of the algorithm here would be two
+// implementations of one polynomial in one registry.
+//
+// THE BYTE ORDER IS NOT THIS MODULE'S.  What these functions answer is
+// a NUMBER; Modbus sends it low byte first, and `mbrtu.crc_low_byte`
+// and `mbrtu.crc_high_byte` are where that lives.  Keeping the two
+// apart is why a caller cannot accidentally checksum the bytes in the
+// order it is about to send them.
+
+// The published check value of CRC-16/MODBUS over the nine bytes
+// `123456789`: 0x4b37.
+//
+// The number that says an implementation is the right variant.  A
+// value that disagrees with another implementation's is almost always
+// the wrong polynomial or the wrong initialisation rather than a wrong
+// implementation, and this is what distinguishes them.
+pub const MB_CRC16_CHECK = 0x4B37
+
+// The CRC-16/MODBUS of a whole buffer.
+//
+// ```novo
+// use mbcrc
+// use std.bytes
+//
+// fn main() [io]
+//     println("${mbcrc.crc16(bytes.from_str("123456789"))}")
+//     // 19255, which is 0x4b37 — the published check value
+// ```
+pub fn crc16(data: Bytes) -> Int []
+    todo("modbus-nv.mbcrc.crc16")
+
+// The state a fresh CRC starts from: 0xffff.
+//
+// Not a check value — this algorithm has no final xor, so the state IS
+// the check value once every byte has gone in, and `crc16_finish`
+// exists for symmetry with every other CRC rather than because it does
+// something.
+pub fn crc16_start() -> Int []
+    todo("modbus-nv.mbcrc.crc16_start")
+
+// One byte folded into a running state.
+//
+// The function a gateway uses: bytes arrive off a UART one at a time
+// and a frame's CRC is known the moment its last byte lands, with no
+// buffer anywhere.
+pub fn crc16_step(state: Int, byte: Int) -> Int []
+    todo("modbus-nv.mbcrc.crc16_step")
+
+// A run of bytes folded into a running state.
+pub fn crc16_update(state: Int, data: Bytes) -> Int []
+    todo("modbus-nv.mbcrc.crc16_update")
+
+// The check value a running state has reached.
+//
+// Which for this algorithm is the state itself, because CRC-16/MODBUS
+// has no final xor.  It exists so that a caller who knows the shape
+// from another CRC writes the same four calls here, and so that the
+// two never diverge if a future variant needs one.
+pub fn crc16_finish(state: Int) -> Int []
+    todo("modbus-nv.mbcrc.crc16_finish")

@@ -1,0 +1,522 @@
+// mbpdu.nv — the protocol data unit, and the limits a conforming
+// server enforces.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `MbReq` AND `MbRsp` ARE THE LOAD-BEARING INTERFACE, and the thing
+// that makes them so is that **an exception is a field on the
+// response, not an error**.
+//
+// Modbus has two kinds of failure and every implementation that
+// conflates them is wrong in a way that shows up only in the field.  A
+// TRANSPORT fault — a timeout, a CRC mismatch, a closed socket — means
+// nobody answered and the request may be retried.  An EXCEPTION means
+// the server answered perfectly: it received the request, understood
+// it, and refused it, with a code saying why.  Those are opposite
+// instructions.  A client that turned exception 2 — "that address does
+// not exist on this device" — into a transport error retries it
+// forever against a device that will never say anything else; a
+// gateway that did the same cannot forward the refusal and invents a
+// timeout its own client then retries.
+//
+// So `MbRsp` carries an `exception` field, `rsp_is_exception` is the
+// question, and `MbError` — `mberr`'s type — is for the transport and
+// nothing else.
+//
+// ONE REQUEST TYPE FOR NINE FUNCTION CODES.  A `@value` struct cannot
+// be an enum payload (E2015), so "a decoded request" cannot be an enum
+// of nine variants each carrying its own record.  What it can be is
+// one record whose fields mean different things per code — and that
+// turned out better than what it replaced, because a gateway forwards
+// a request it does not need to understand, and a server's dispatch is
+// one `match` on an `Int` rather than nine.
+//
+// THE COUNT LIMITS ARE FUNCTIONS, NOT PROSE.  Modbus fixes a maximum
+// quantity per function code — 2000 coils for a read, 125 registers,
+// 1968 coils for a multiple write, 123 registers, and 125 read with
+// 121 write for the combined one — and a request past its limit gets
+// exception 3 from a conforming server and silence from a bad one.
+// `max_count` is that table, and `check_req` is what stops a request
+// leaving a client that the device was always going to refuse.
+
+// ── The function codes ───────────────────────────────────────────────
+
+// Read coils — single output bits.
+pub const MB_FC_READ_COILS = 1
+// Read discrete inputs — single input bits, read only.
+pub const MB_FC_READ_DISCRETE_INPUTS = 2
+// Read holding registers — the sixteen-bit words most of a device's
+// configuration lives in.
+pub const MB_FC_READ_HOLDING = 3
+// Read input registers — sixteen-bit words, read only.
+pub const MB_FC_READ_INPUT = 4
+// Write a single coil.
+pub const MB_FC_WRITE_SINGLE_COIL = 5
+// Write a single holding register.
+pub const MB_FC_WRITE_SINGLE_HOLDING = 6
+// Write multiple coils.
+pub const MB_FC_WRITE_MULTIPLE_COILS = 15
+// Write multiple holding registers.
+pub const MB_FC_WRITE_MULTIPLE_HOLDING = 16
+// Read and write multiple registers in one transaction — the READ
+// HAPPENS FIRST, which is the one thing about this code worth knowing
+// and the thing every implementation has to get right the same way.
+pub const MB_FC_READ_WRITE_MULTIPLE = 23
+
+// The bit a server sets in the function code of an exception
+// response: 0x80.
+//
+// So function code 3 refused comes back as 0x83.  A client that
+// masked this off before dispatching would treat an exception as a
+// successful read of zero registers.
+pub const MB_EXCEPTION_FLAG = 0x80
+
+// ── The exception codes ──────────────────────────────────────────────
+
+// Illegal function: the server does not implement that function code.
+pub const MB_EX_ILLEGAL_FUNCTION = 1
+// Illegal data address: the address, or the whole range, is not on
+// this device.  The commonest exception by a wide margin, and the one
+// a client must not retry.
+pub const MB_EX_ILLEGAL_DATA_ADDRESS = 2
+// Illegal data value: the quantity is outside what the function
+// allows, or a written value is one the device refuses.  What a
+// request past `max_count` comes back as.
+pub const MB_EX_ILLEGAL_DATA_VALUE = 3
+// Server device failure: something went wrong inside the device while
+// it was performing the request.
+pub const MB_EX_SERVER_FAILURE = 4
+// Acknowledge: the request was accepted and will take a long time.
+// NOT an error — the client polls with function 11 rather than
+// retrying, which is the one exception code that means carry on.
+pub const MB_EX_ACKNOWLEDGE = 5
+// Server device busy: the device is processing a long command and the
+// request should be sent again later.
+pub const MB_EX_SERVER_BUSY = 6
+// Memory parity error, for the file-access functions.
+pub const MB_EX_MEMORY_PARITY = 8
+// Gateway path unavailable: a gateway could not route the request.
+pub const MB_EX_GATEWAY_PATH = 10
+// Gateway target failed to respond: a gateway routed the request and
+// the device behind it did not answer.  The code that lets a gateway
+// forward a timeout as an exception rather than inventing one.
+pub const MB_EX_GATEWAY_TARGET = 11
+
+// ── The quantity limits ──────────────────────────────────────────────
+
+// The most coils a single read may ask for: 2000.
+pub const MB_MAX_READ_COILS = 2000
+// The most registers a single read may ask for: 125.
+pub const MB_MAX_READ_REGS = 125
+// The most coils a multiple write may carry: 1968.
+pub const MB_MAX_WRITE_COILS = 1968
+// The most registers a multiple write may carry: 123.
+pub const MB_MAX_WRITE_REGS = 123
+// The most registers function 23 may read: 125.
+pub const MB_MAX_RW_READ_REGS = 125
+// The most registers function 23 may write: 121.
+pub const MB_MAX_RW_WRITE_REGS = 121
+
+// The largest protocol data unit, framing excluded: 253 bytes.
+//
+// Which is 256 minus the RTU address byte and its two CRC bytes — the
+// serial framing decided the limit and TCP inherited it, which is why
+// a Modbus TCP frame is 253 bytes of payload and not 65535.
+pub const MB_MAX_PDU_LEN = 253
+
+// The most units a function code may ask for, or -1 for a code with
+// no quantity.
+//
+// The table rather than the prose.  A request past its limit gets
+// exception 3 from a conforming server and silence from a bad one, and
+// either way the round trip is wasted — so a client checks before it
+// sends.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbpdu.max_count(mbpdu.MB_FC_READ_HOLDING)}")   // 125
+//     println("${mbpdu.max_count(mbpdu.MB_FC_READ_COILS)}")     // 2000
+// ```
+pub fn max_count(fc: Int) -> Int []
+    todo("modbus-nv.mbpdu.max_count")
+
+// The most units function 23 may WRITE, which is not the same as what
+// it may read.
+//
+// 121 against 125, because the response carries the read data and the
+// request carries the write data and they are different packets with
+// the same 253-byte ceiling.  Its own function because one `max_count`
+// cannot answer two numbers.
+pub fn max_write_count(fc: Int) -> Int []
+    todo("modbus-nv.mbpdu.max_write_count")
+
+// Whether a function code addresses bits rather than sixteen-bit
+// words.
+//
+// The distinction that decides how a response's byte count is
+// computed: bits are packed eight to a byte and words take two each,
+// and a client that read a coil response as registers gets plausible
+// numbers that are wrong.
+pub fn is_bit_function(fc: Int) -> Bool []
+    todo("modbus-nv.mbpdu.is_bit_function")
+
+// Whether a function code writes.
+pub fn is_write_function(fc: Int) -> Bool []
+    todo("modbus-nv.mbpdu.is_write_function")
+
+// Whether a function code reads.
+pub fn is_read_function(fc: Int) -> Bool []
+    todo("modbus-nv.mbpdu.is_read_function")
+
+// Whether this package implements the function code at all.
+pub fn is_supported(fc: Int) -> Bool []
+    todo("modbus-nv.mbpdu.is_supported")
+
+// ── The request ──────────────────────────────────────────────────────
+
+// One request, whichever function code it carries.
+//
+// Five integers.  Which fields are meaningful depends on `fc`:
+//
+//   1, 2, 3, 4     `start` and `count`
+//   5, 6           `start` and `value`
+//   15, 16         `start` and `count`, with the data the caller's
+//   23             `start` and `count` to read, `write_start` and
+//                  `write_count` to write
+//
+// One record rather than nine, because a `@value` struct cannot be an
+// enum payload (E2015) — and because a gateway forwards a request it
+// does not need to understand, and a server's dispatch is one `match`
+// on an `Int` rather than nine.
+pub @value
+struct MbReq
+    // The function code.
+    fc: Int
+    // The first address.  ON THE WIRE AND NOT IN A DATA MODEL: address
+    // 0 here is the coil a manual calls 000001, and the off-by-one
+    // between the two is the single most common Modbus mistake.
+    start: Int
+    // How many units, for a function that reads or writes several.
+    count: Int
+    // The value, for functions 5 and 6.
+    value: Int
+    // Function 23's write address.
+    write_start: Int
+    // Function 23's write quantity.
+    write_count: Int
+
+// A read request: function 1, 2, 3 or 4.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     let r = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 10)
+//     println("${mbpdu.req_count(r)}")   // 10
+// ```
+pub fn read_req(fc: Int, start: Int, count: Int) -> MbReq []
+    todo("modbus-nv.mbpdu.read_req")
+
+// A single-write request: function 5 or 6.
+//
+// For a coil the value is 0xFF00 for on and 0x0000 for off, and
+// NOTHING ELSE — a device that receives 0x0001 for "on" is required to
+// refuse it.  `coil_on` and `coil_off` are the two constants.
+pub fn write_single_req(fc: Int, address: Int, value: Int) -> MbReq []
+    todo("modbus-nv.mbpdu.write_single_req")
+
+// A multiple-write request: function 15 or 16.  The data is the
+// caller's.
+pub fn write_multiple_req(fc: Int, start: Int, count: Int) -> MbReq []
+    todo("modbus-nv.mbpdu.write_multiple_req")
+
+// A function 23 request: read one range and write another in one
+// transaction.
+//
+// THE READ HAPPENS FIRST, which is the specification's own rule and
+// the one thing about this function that has to be agreed: a client
+// that expected the written values back reads what was there before,
+// and both behaviours look correct from one side.
+pub fn read_write_req(read_start: Int, read_count: Int, write_start: Int,
+                      write_count: Int) -> MbReq []
+    todo("modbus-nv.mbpdu.read_write_req")
+
+// The function code.
+pub fn req_fc(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_fc")
+
+// The first address.
+pub fn req_start(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_start")
+
+// The quantity.
+pub fn req_count(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_count")
+
+// The single value, for functions 5 and 6.
+pub fn req_value(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_value")
+
+// Function 23's write address.
+pub fn req_write_start(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_write_start")
+
+// Function 23's write quantity.
+pub fn req_write_count(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_write_count")
+
+// The last address the request touches.
+//
+// `start + count - 1`, computed once here so that a range check cannot
+// be written with the off-by-one in it — which is the check every
+// server gets wrong at least once, and the one whose symptom is
+// exception 2 on the last address of a valid range.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbpdu.req_last(mbpdu.read_req(3, 0, 10))}")   // 9
+// ```
+pub fn req_last(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_last")
+
+// How many bytes this request occupies as a protocol data unit,
+// function code included and framing excluded.
+pub fn req_len(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_len")
+
+// The `i`-th wire byte of a request, BIG-ENDIAN throughout.
+//
+// Modbus is big-endian on the wire and always has been, which is the
+// opposite of nearly every other protocol in this project — so the
+// byte order is stated here rather than left to be discovered.
+//
+// The data bytes of a multiple write follow this header and are the
+// caller's; `req_header_len` says where they begin.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     let r = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 1, 2)
+//     println("${mbpdu.req_byte(r, 1)}")   // 0, the address's high byte
+// ```
+pub fn req_byte(r: MbReq, i: Int) -> Int []
+    todo("modbus-nv.mbpdu.req_byte")
+
+// Where a multiple write's data begins inside its protocol data unit.
+pub fn req_header_len(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.req_header_len")
+
+// Decode a request from the bytes at `off`.
+//
+// Answers a zeroed request on malformed input, because a `@value`
+// struct cannot be a `Result` payload (E2015); `check_req` is the
+// refusal beside it.
+pub fn req_decode(buf: [u8], off: Int, len: Int) -> MbReq []
+    todo("modbus-nv.mbpdu.req_decode")
+
+// Why a request would be refused, or nothing.
+//
+// The check a client makes before it sends and a server makes before
+// it looks anything up: an unsupported function code, a quantity past
+// its limit, an address above 65535, a coil value that is neither
+// 0xFF00 nor 0x0000.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbpdu.req_count(mbpdu.read_req(3, 0, 126))}")   // 126, past the limit
+// ```
+pub fn check_req(r: MbReq) -> ?MbError []
+    todo("modbus-nv.mbpdu.check_req")
+
+// The exception code a conforming server would answer this request
+// with, or 0 when it would not refuse it on the request's own terms.
+//
+// Separate from `check_req` because the two answer different
+// questions: `check_req` is for a CLIENT deciding whether to send, and
+// this is for a SERVER deciding what to reply.  A server that sent
+// nothing where an exception was due leaves a client timing out, which
+// is the failure that looks like a broken cable.
+pub fn exception_for(r: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.exception_for")
+
+// ── Coil values ──────────────────────────────────────────────────────
+
+// The value a single-coil write uses for on: 0xFF00.
+pub const MB_COIL_ON = 0xFF00
+// The value for off: 0x0000.
+pub const MB_COIL_OFF = 0x0000
+
+// Whether a single-coil write's value means on.
+//
+// And nothing else is legal: a device that receives 0x0001 is required
+// to refuse it, which is a rule that surprises everybody exactly once.
+pub fn coil_is_on(value: Int) -> Bool []
+    todo("modbus-nv.mbpdu.coil_is_on")
+
+// Whether a value is one of the two a single-coil write may carry.
+pub fn coil_value_ok(value: Int) -> Bool []
+    todo("modbus-nv.mbpdu.coil_value_ok")
+
+// ── The response ─────────────────────────────────────────────────────
+
+// One response, whichever function code it answers.
+//
+// `exception` is the field this type exists for: nonzero means the
+// server answered and refused, which is a completely different
+// instruction from a transport fault.
+pub @value
+struct MbRsp
+    // The function code, with `MB_EXCEPTION_FLAG` already stripped.
+    fc: Int
+    // The exception code, or 0 when the server did not refuse.
+    exception: Int
+    // How many data bytes follow, for a read.
+    byte_count: Int
+    // The echoed address, for a write.
+    start: Int
+    // The echoed value or quantity, for a write.
+    value: Int
+
+// A read response header.  The data bytes are the caller's.
+pub fn read_rsp(fc: Int, byte_count: Int) -> MbRsp []
+    todo("modbus-nv.mbpdu.read_rsp")
+
+// A write response, which echoes the address and the value or quantity
+// the request carried.
+//
+// An echo rather than an acknowledgement, and that is useful: a client
+// that compares them catches a gateway that rewrote an address, which
+// is otherwise silent.
+pub fn write_rsp(fc: Int, start: Int, value: Int) -> MbRsp []
+    todo("modbus-nv.mbpdu.write_rsp")
+
+// An exception response.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     let r = mbpdu.exception_rsp(mbpdu.MB_FC_READ_HOLDING,
+//                                 mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+//     println("${mbpdu.rsp_is_exception(r)}")   // true
+// ```
+pub fn exception_rsp(fc: Int, exception: Int) -> MbRsp []
+    todo("modbus-nv.mbpdu.exception_rsp")
+
+// The function code, exception flag stripped.
+pub fn rsp_fc(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_fc")
+
+// The exception code, or 0.
+pub fn rsp_exception(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_exception")
+
+// Whether the server answered and refused.
+//
+// THE QUESTION THIS PACKAGE IS ABOUT.  True means the request reached
+// a working server which understood it and said no; a client that
+// retries is retrying something that will never succeed, and a gateway
+// that cannot forward it invents a timeout its own client then
+// retries.
+pub fn rsp_is_exception(r: MbRsp) -> Bool []
+    todo("modbus-nv.mbpdu.rsp_is_exception")
+
+// How many data bytes follow a read response.
+pub fn rsp_byte_count(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_byte_count")
+
+// The echoed address, for a write response.
+pub fn rsp_start(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_start")
+
+// The echoed value or quantity.
+pub fn rsp_value(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_value")
+
+// How many bytes this response occupies as a protocol data unit.
+pub fn rsp_len(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_len")
+
+// The `i`-th wire byte of a response, big-endian, the read data
+// excluded.
+pub fn rsp_byte(r: MbRsp, i: Int) -> Int []
+    todo("modbus-nv.mbpdu.rsp_byte")
+
+// Where a read response's data begins inside its protocol data unit.
+pub fn rsp_header_len(r: MbRsp) -> Int []
+    todo("modbus-nv.mbpdu.rsp_header_len")
+
+// Decode a response from the bytes at `off`.
+pub fn rsp_decode(buf: [u8], off: Int, len: Int) -> MbRsp []
+    todo("modbus-nv.mbpdu.rsp_decode")
+
+// Whether this response answers that request.
+//
+// The function codes have to match, and for a write the echoed address
+// has to as well.  An exception response answering the right function
+// code IS a match — it is an answer, and a client that treated it as a
+// mismatch would report a protocol fault where the server was being
+// perfectly clear.
+pub fn rsp_matches(r: MbRsp, q: MbReq) -> Bool []
+    todo("modbus-nv.mbpdu.rsp_matches")
+
+// Why a response cannot be believed, or nothing.
+//
+// A byte count that does not follow from the request, a function code
+// that answers a different one — the transport faults, which is what
+// `MbError` is for.  An EXCEPTION is not one of them.
+pub fn check_rsp(r: MbRsp, q: MbReq) -> ?MbError []
+    todo("modbus-nv.mbpdu.check_rsp")
+
+// How many data bytes a response to this request should carry.
+//
+// Bits are packed eight to a byte and round up; words take two each.
+// The number a client checks the response's own byte count against,
+// and the check that catches a device answering the wrong function's
+// data.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbpdu.expected_byte_count(mbpdu.read_req(1, 0, 9))}")   // 2
+//     println("${mbpdu.expected_byte_count(mbpdu.read_req(3, 0, 9))}")   // 18
+// ```
+pub fn expected_byte_count(q: MbReq) -> Int []
+    todo("modbus-nv.mbpdu.expected_byte_count")
+
+// An exception code in words.
+//
+// The specification's own sentences, so a device that answers 2 and a
+// log that reports it agree.
+pub fn exception_name(exception: Int) -> Str []
+    todo("modbus-nv.mbpdu.exception_name")
+
+// A function code in words.
+pub fn function_name(fc: Int) -> Str []
+    todo("modbus-nv.mbpdu.function_name")
+
+// Whether an exception code means "wait and ask again" rather than
+// "this will never work".
+//
+// `MB_EX_ACKNOWLEDGE` and `MB_EX_SERVER_BUSY` are the two, and the
+// distinction matters as much as the transport one: a client that
+// treats a busy device as a permanent refusal gives up on a device
+// that was about to be ready, and one that retries an illegal address
+// forever never stops.
+//
+// ```novo
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbpdu.exception_is_transient(mbpdu.MB_EX_SERVER_BUSY)}")   // true
+// ```
+pub fn exception_is_transient(exception: Int) -> Bool []
+    todo("modbus-nv.mbpdu.exception_is_transient")

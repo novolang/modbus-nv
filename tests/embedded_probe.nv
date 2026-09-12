@@ -1,0 +1,241 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHAT THE CLAIM COVERS: the codec and both framings — `mbpdu`,
+// `mbrtu` and `mbtcp`.  THE CONSUMER IS A GATEWAY: a sensorhub-class
+// device with an RS-485 port on one side and a radio on the other,
+// decoding a request in a UART interrupt on a part with 64 KB of RAM
+// and re-encoding it onto the other wire.  That device runs all three
+// modules and cannot allocate in any of them, which is what this file
+// exists to keep true.
+//
+// WHAT IS DELIBERATELY OUT.  `mbclient` is `host` and named in the
+// manifest's `host_modules`, so the audit leaves it behind.  `mbcrc`
+// is the one module that names crc-nv, and leaving it out keeps the
+// probe's closure to this package's own sources — which is why
+// `mbrtu` takes and answers a CRC as an `Int`, and why a gateway whose
+// microcontroller has a CRC peripheral passes its hardware's answer
+// in.  `mbmap` is `core` and would build; it is not named here because
+// a gateway forwards rather than serves, and a server on a device is a
+// second claim rather than this one.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be.
+// Every body under `src/` is a `todo()`, so what links today is the
+// SIGNATURES and the types, with no allocator anywhere in the shape.
+// There is no arithmetic in the binary yet, so this probe does not
+// prove a frame is decoded without allocating; it proves that nothing
+// in the shape of the surface needs an allocator or a host.  Keeping
+// it green once the bodies land is a named cost of the implementation
+// step.
+
+use mbpdu
+use mbrtu
+use mbtcp
+
+// A gateway's own numbers, as a firmware holds them: unit 1 on the
+// RS-485 side at 9600 baud, holding registers from 0, and ten of them
+// per poll.
+const UNIT: Int = 1
+const BAUD: Int = 9600
+const START: Int = 0
+const COUNT: Int = 10
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of
+// output; making it depend on all of them is what stops a passing run
+// from meaning "the first call linked".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // ── The protocol data unit ───────────────────────────────────────
+    let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, START, COUNT)
+    if mbpdu.req_fc(q) == mbpdu.MB_FC_READ_HOLDING
+        n = n + 1
+    if mbpdu.req_start(q) == START
+        n = n + 1
+    if mbpdu.req_count(q) == COUNT
+        n = n + 1
+    // The last address, computed once so a range check cannot carry
+    // the off-by-one that answers exception 2 on a valid range.
+    if mbpdu.req_last(q) == 9
+        n = n + 1
+    if mbpdu.req_len(q) == 5
+        n = n + 1
+    // Big-endian, which is the opposite of nearly everything else here.
+    if mbpdu.req_byte(q, 0) == mbpdu.MB_FC_READ_HOLDING
+        n = n + 1
+    if mbpdu.req_byte(q, 3) == 0
+        n = n + 1
+    if mbpdu.req_byte(q, 4) == COUNT
+        n = n + 1
+
+    // The per-code limits, as functions rather than prose.
+    if mbpdu.max_count(mbpdu.MB_FC_READ_HOLDING) == 125
+        n = n + 1
+    if mbpdu.max_count(mbpdu.MB_FC_READ_COILS) == 2000
+        n = n + 1
+    if mbpdu.max_count(mbpdu.MB_FC_WRITE_MULTIPLE_COILS) == 1968
+        n = n + 1
+    if mbpdu.max_write_count(mbpdu.MB_FC_READ_WRITE_MULTIPLE) == 121
+        n = n + 1
+
+    if mbpdu.is_bit_function(mbpdu.MB_FC_READ_COILS)
+        n = n + 1
+    if mbpdu.is_bit_function(mbpdu.MB_FC_READ_HOLDING) == false
+        n = n + 1
+    if mbpdu.is_write_function(mbpdu.MB_FC_WRITE_SINGLE_COIL)
+        n = n + 1
+    if mbpdu.is_supported(mbpdu.MB_FC_READ_WRITE_MULTIPLE)
+        n = n + 1
+    if mbpdu.is_supported(99) == false
+        n = n + 1
+
+    // Bits pack eight to a byte and words take two each, which is the
+    // arithmetic a gateway checks a response's byte count against.
+    if mbpdu.expected_byte_count(mbpdu.read_req(mbpdu.MB_FC_READ_COILS, 0, 9)) == 2
+        n = n + 1
+    if mbpdu.expected_byte_count(q) == 20
+        n = n + 1
+
+    // A single coil write carries 0xFF00 or 0x0000 and nothing else.
+    if mbpdu.coil_is_on(mbpdu.MB_COIL_ON)
+        n = n + 1
+    if mbpdu.coil_value_ok(1) == false
+        n = n + 1
+
+    // ── An exception is a RESPONSE ───────────────────────────────────
+    let ex = mbpdu.exception_rsp(mbpdu.MB_FC_READ_HOLDING,
+                                 mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+    if mbpdu.rsp_is_exception(ex)
+        n = n + 1
+    if mbpdu.rsp_exception(ex) == mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS
+        n = n + 1
+    if mbpdu.rsp_fc(ex) == mbpdu.MB_FC_READ_HOLDING
+        n = n + 1
+    // The high bit set in the function code is how it goes out.
+    if mbpdu.rsp_byte(ex, 0) == mbpdu.MB_FC_READ_HOLDING + mbpdu.MB_EXCEPTION_FLAG
+        n = n + 1
+    let ok = mbpdu.read_rsp(mbpdu.MB_FC_READ_HOLDING, 20)
+    if mbpdu.rsp_is_exception(ok) == false
+        n = n + 1
+    // Busy means wait; an illegal address never will not.
+    if mbpdu.exception_is_transient(mbpdu.MB_EX_SERVER_BUSY)
+        n = n + 1
+    if mbpdu.exception_is_transient(mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS) == false
+        n = n + 1
+
+    // ── RTU framing, which has no delimiter ──────────────────────────
+    if mbrtu.frame_len(5) == 8
+        n = n + 1
+    if mbrtu.pdu_offset() == 1
+        n = n + 1
+    if mbrtu.crc_offset(8) == 6
+        n = n + 1
+    if mbrtu.crc_covers(8) == 6
+        n = n + 1
+    // The CRC goes out low byte first — the one little-endian field.
+    if mbrtu.crc_low_byte(0xC40B) == 0x0B
+        n = n + 1
+    if mbrtu.crc_high_byte(0xC40B) == 0xC4
+        n = n + 1
+
+    // 1 to 247, with 0 the broadcast nobody answers.
+    if mbrtu.address_is_valid(UNIT)
+        n = n + 1
+    if mbrtu.address_is_valid(248) == false
+        n = n + 1
+    if mbrtu.is_broadcast(mbrtu.MB_ADDR_BROADCAST)
+        n = n + 1
+    if mbrtu.expects_reply(mbrtu.MB_ADDR_BROADCAST) == false
+        n = n + 1
+    if mbrtu.addressed_to_us(mbrtu.MB_ADDR_BROADCAST, UNIT)
+        n = n + 1
+    if mbrtu.addressed_to_us(2, UNIT) == false
+        n = n + 1
+
+    // The silence: 3.5 characters below 19200 baud, a fixed 1750 µs at
+    // and above it — because 3.5 characters at 115200 is 304 µs and
+    // nothing with an operating system can measure that.
+    if mbrtu.silence_us(BAUD) > mbrtu.MB_FIXED_SILENCE_US
+        n = n + 1
+    if mbrtu.silence_us(115200) == mbrtu.MB_FIXED_SILENCE_US
+        n = n + 1
+    if mbrtu.char_timeout_us(BAUD) < mbrtu.silence_us(BAUD)
+        n = n + 1
+
+    // And the counting that makes the timing unnecessary for most
+    // frames: a read request is always eight bytes.
+    if mbrtu.expected_req_len(mbpdu.MB_FC_READ_HOLDING, 0) == 8
+        n = n + 1
+    if mbrtu.header_bytes_needed(mbpdu.MB_FC_READ_HOLDING) > 0
+        n = n + 1
+    if mbrtu.expected_rsp_len(mbpdu.MB_FC_READ_HOLDING, 20) == 25
+        n = n + 1
+
+    // ── TCP framing, which is counting all the way ───────────────────
+    let h = mbtcp.mbap(7, UNIT, 5)
+    if mbtcp.mbap_transaction(h) == 7
+        n = n + 1
+    if mbtcp.mbap_unit(h) == UNIT
+        n = n + 1
+    // The length field counts the unit identifier too, which is the
+    // off-by-one every first implementation makes.
+    if mbtcp.mbap_length(h) == 6
+        n = n + 1
+    if mbtcp.mbap_pdu_len(h) == 5
+        n = n + 1
+    if mbtcp.mbap_protocol(h) == mbtcp.MB_TCP_PROTOCOL_ID
+        n = n + 1
+    if mbtcp.frame_len(5) == 12
+        n = n + 1
+    if mbtcp.pdu_offset() == mbtcp.MB_MBAP_LEN
+        n = n + 1
+    // Big-endian throughout, with no little-endian field at all.
+    if mbtcp.mbap_byte(mbtcp.mbap(0x1234, UNIT, 5), 0) == 0x12
+        n = n + 1
+    if mbtcp.mbap_byte(mbtcp.mbap(0x1234, UNIT, 5), 1) == 0x34
+        n = n + 1
+    // Six bytes is enough to know how long the frame is, which is the
+    // whole of framing over TCP.
+    if mbtcp.MB_TCP_HEADER_PREFIX == 6
+        n = n + 1
+    // A reply is paired by transaction AND unit, because a gateway may
+    // reuse an identifier across the devices behind it.
+    if mbtcp.mbap_answers(mbtcp.mbap(7, UNIT, 5), h)
+        n = n + 1
+    if mbtcp.mbap_answers(mbtcp.mbap(7, 2, 5), h) == false
+        n = n + 1
+    if mbtcp.next_transaction(65535) == 0
+        n = n + 1
+
+    // The gateway's own operation: a TCP header for an RTU frame, and
+    // the address back out again.
+    let fwd = mbtcp.from_rtu(9, UNIT, 5)
+    if mbtcp.to_rtu_address(fwd) == UNIT
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 53 is the number of checks in `score` on the path a linked build
+    // takes.  The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 53
+        hal.uart.write("PASS: modbus-embedded\n")
+    else
+        hal.uart.write("FAIL: modbus-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

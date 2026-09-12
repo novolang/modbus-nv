@@ -1,0 +1,299 @@
+// mbframe_tests.nv — the two envelopes: RTU's silence and CRC, and
+// TCP's length field and transaction identifier.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: modbus-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE THE SERIAL LINE AND TCP SPECIFICATIONS' OWN NUMBERS.
+// The 3.5-character silence and its fixed 1750 µs above 19200 baud are
+// § 2.5.1.1 of the serial line specification; the 11 bits per character
+// is the same section; the CRC's low-byte-first order is § 2.5.1.2; and
+// the MBAP header's four fields are § 4.1 of the TCP one.  The
+// CRC-16/MODBUS check value 0x4b37 over `123456789` is the catalogue's,
+// and crc-nv publishes it.
+
+use std.test
+use mbrtu
+use mbtcp
+use mbcrc
+use mbpdu
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?MbError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+// ── RTU ──────────────────────────────────────────────────────────────
+
+@test
+fn test_a_frame_is_an_address_a_pdu_and_a_crc() [io]
+    test.assert_eq(mbrtu.MB_RTU_OVERHEAD, 3)
+    test.assert_eq(mbrtu.frame_len(5), 8)
+    test.assert_eq(mbrtu.pdu_len(8), 5)
+    test.assert_eq(mbrtu.pdu_offset(), 1)
+    test.assert_eq(mbrtu.crc_offset(8), 6)
+    test.assert_eq(mbrtu.crc_covers(8), 6)
+
+    test.case("and the largest is 256, which is where the 253-byte PDU ceiling came from")
+    test.assert_eq(mbrtu.MB_RTU_MAX_FRAME, 256)
+    test.assert_eq(mbrtu.frame_len(mbpdu.MB_MAX_PDU_LEN), 256)
+
+@test
+fn test_the_crc_goes_out_low_byte_first() [io]
+    test.case("the one place Modbus is little-endian, against a PDU that is big-endian throughout")
+    test.assert_eq(mbrtu.crc_low_byte(0xC40B), 0x0B)
+    test.assert_eq(mbrtu.crc_high_byte(0xC40B), 0xC4)
+    test.assert_eq(mbrtu.crc_low_byte(0x1234), 0x34)
+    test.assert_eq(mbrtu.crc_high_byte(0x1234), 0x12)
+
+@test
+fn test_a_request_frame_is_the_address_then_the_pdu_then_the_crc() [io]
+    let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 10)
+    test.assert_eq(mbrtu.req_frame_byte(1, q, 0xC40B, 0), 1)
+    test.assert_eq(mbrtu.req_frame_byte(1, q, 0xC40B, 1), 0x03)
+    test.assert_eq(mbrtu.req_frame_byte(1, q, 0xC40B, 5), 0x0A)
+    test.assert_eq(mbrtu.req_frame_byte(1, q, 0xC40B, 6), 0x0B)
+    test.assert_eq(mbrtu.req_frame_byte(1, q, 0xC40B, 7), 0xC4)
+
+@test
+fn test_the_addresses_a_device_may_have() [io]
+    test.case("1 to 247; 248 to 255 are reserved and a device configured there works between two implementations that agree and fails against everything else")
+    test.assert_eq(mbrtu.MB_ADDR_MIN, 1)
+    test.assert_eq(mbrtu.MB_ADDR_MAX, 247)
+    test.assert(mbrtu.address_is_valid(1))
+    test.assert(mbrtu.address_is_valid(247))
+    test.assert(mbrtu.address_is_valid(0) == false)
+    test.assert(mbrtu.address_is_valid(248) == false)
+    test.assert(mbrtu.address_is_valid(255) == false)
+
+@test
+fn test_nobody_answers_a_broadcast() [io]
+    test.case("the rule a client has to know before it sends one: waiting for a reply is waiting forever")
+    test.assert_eq(mbrtu.MB_ADDR_BROADCAST, 0)
+    test.assert(mbrtu.is_broadcast(0))
+    test.assert(mbrtu.expects_reply(0) == false)
+    test.assert(mbrtu.expects_reply(1))
+
+    test.case("and every device acts on it, which is what the turnaround delay is for")
+    test.assert(mbrtu.addressed_to_us(0, 1))
+    test.assert(mbrtu.addressed_to_us(0, 247))
+    test.assert(mbrtu.turnaround_us(9600) > 0)
+
+@test
+fn test_a_device_answers_its_own_address_and_the_broadcast_and_nothing_else() [io]
+    test.assert(mbrtu.addressed_to_us(1, 1))
+    test.assert(mbrtu.addressed_to_us(2, 1) == false)
+
+@test
+fn test_the_silence_is_three_and_a_half_characters_until_it_is_not() [io]
+    test.case("serial line specification section 2.5.1.1: computed below 19200 baud, and a FIXED 1750 microseconds at and above it")
+    test.assert_eq(mbrtu.MB_FIXED_SILENCE_BAUD, 19200)
+    test.assert_eq(mbrtu.MB_FIXED_SILENCE_US, 1750)
+    test.assert_eq(mbrtu.silence_us(115200), 1750)
+    test.assert_eq(mbrtu.silence_us(19200), 1750)
+
+    test.case("and at 9600 baud it is 3.5 characters of 11 bits: 4010 microseconds")
+    test.assert_eq(mbrtu.MB_BITS_PER_CHAR, 11)
+    test.assert_eq(mbrtu.char_time_us(9600), 1145)
+    test.assert_eq(mbrtu.silence_us(9600), 4010)
+
+    test.case("the reason for the exception is arithmetic — 3.5 characters at 115200 is 304 microseconds, and nothing with an operating system can measure that")
+    test.assert(mbrtu.silence_us(115200) > 304)
+
+@test
+fn test_the_inter_character_timeout_is_a_different_timer() [io]
+    test.case("a gap longer than this INSIDE a frame means the frame is corrupt; a gap longer than the inter-frame silence means the frame is over")
+    test.assert(mbrtu.char_timeout_us(9600) < mbrtu.silence_us(9600))
+    test.assert_eq(mbrtu.char_timeout_us(115200), 750)
+
+    test.case("an implementation with only one of the two either accepts frames with holes in them or splits good ones")
+    test.assert(mbrtu.char_timeout_us(9600) > 0)
+
+@test
+fn test_a_frames_length_can_usually_be_counted_rather_than_timed() [io]
+    test.case("the half of having no delimiter that is solvable: a read request is always eight bytes")
+    test.assert_eq(mbrtu.expected_req_len(mbpdu.MB_FC_READ_HOLDING, 0), 8)
+    test.assert_eq(mbrtu.expected_req_len(mbpdu.MB_FC_READ_COILS, 0), 8)
+    test.assert_eq(mbrtu.expected_req_len(mbpdu.MB_FC_WRITE_SINGLE_HOLDING, 0), 8)
+
+    test.case("and a multiple write is eight plus its byte count, which the header carries")
+    test.assert_eq(mbrtu.expected_req_len(mbpdu.MB_FC_WRITE_MULTIPLE_HOLDING, 4), 13)
+
+    test.case("a read response is five plus its byte count")
+    test.assert_eq(mbrtu.expected_rsp_len(mbpdu.MB_FC_READ_HOLDING, 20), 25)
+
+@test
+fn test_a_receiver_knows_how_many_bytes_it_needs_first() [io]
+    test.case("the number a receive state machine is written around, and the difference between a gateway that works at 115200 baud and one that does not")
+    test.assert(mbrtu.header_bytes_needed(mbpdu.MB_FC_READ_HOLDING) > 0)
+    test.assert(mbrtu.header_bytes_needed(mbpdu.MB_FC_WRITE_MULTIPLE_HOLDING) > 0)
+
+@test
+fn test_an_exception_frame_is_always_five_bytes() [io]
+    test.case("fixed, which is why a receiver can recognise one from three bytes")
+    test.assert_eq(mbrtu.MB_RTU_EXCEPTION_FRAME_LEN, 5)
+    let wire: [u8] = [0x01 as u8, 0x83 as u8, 0x02 as u8, 0x00 as u8, 0x00 as u8]
+    test.assert(mbrtu.looks_like_exception(wire, 0, 5))
+
+    let ok: [u8] = [0x01 as u8, 0x03 as u8, 0x02 as u8, 0x00 as u8, 0x00 as u8]
+    test.assert(mbrtu.looks_like_exception(ok, 0, 5) == false)
+
+@test
+fn test_the_address_and_crc_are_read_out_of_a_frame() [io]
+    let wire: [u8] = [0x01 as u8, 0x03 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x0A as u8, 0x0B as u8, 0xC4 as u8]
+    test.assert_eq(mbrtu.frame_address(wire, 0, 8), 1)
+    test.assert_eq(mbrtu.frame_crc(wire, 0, 8), 0xC40B)
+    test.assert(mbrtu.crc_ok(wire, 0, 8, 0xC40B))
+    test.assert(mbrtu.crc_ok(wire, 0, 8, 0x1234) == false)
+    test.assert(refused(mbrtu.check_frame(wire, 0, 8, 0x1234)))
+
+@test
+fn test_a_timeout_is_arithmetic_rather_than_a_number_somebody_picked() [io]
+    test.case("at 9600 baud a 256-byte frame takes a quarter of a second to send and another to answer, and a client with a 100 ms timeout never sees a long reply")
+    test.assert_eq(mbrtu.transmit_us(8, 9600), 9166)
+    test.assert(mbrtu.transmit_us(256, 9600) > 250000)
+
+    test.assert(mbrtu.reply_timeout_us(8, 25, 9600, 50)
+                > mbrtu.transmit_us(8, 9600) + mbrtu.transmit_us(25, 9600))
+
+// ── TCP ──────────────────────────────────────────────────────────────
+
+@test
+fn test_the_mbap_header_is_seven_bytes() [io]
+    test.assert_eq(mbtcp.MB_MBAP_LEN, 7)
+    test.assert_eq(mbtcp.frame_len(5), 12)
+    test.assert_eq(mbtcp.pdu_offset(), 7)
+    test.assert_eq(mbtcp.MB_TCP_MAX_FRAME, 260)
+    test.assert_eq(mbtcp.MB_TCP_PORT, 502)
+
+@test
+fn test_the_length_field_counts_the_unit_identifier_too() [io]
+    test.case("the off-by-one every first implementation makes: it is pdu_len + 1 and not pdu_len")
+    let h = mbtcp.mbap(1, mbtcp.MB_TCP_UNIT_NONE, 5)
+    test.assert_eq(mbtcp.mbap_length(h), 6)
+    test.assert_eq(mbtcp.mbap_pdu_len(h), 5)
+
+@test
+fn test_the_header_is_big_endian_throughout() [io]
+    test.case("no little-endian field at all, which is the other difference from RTU")
+    let h = mbtcp.mbap(0x1234, 0xFF, 5)
+    test.assert_eq(mbtcp.mbap_byte(h, 0), 0x12)
+    test.assert_eq(mbtcp.mbap_byte(h, 1), 0x34)
+    test.assert_eq(mbtcp.mbap_byte(h, 2), 0x00)
+    test.assert_eq(mbtcp.mbap_byte(h, 3), 0x00)
+    test.assert_eq(mbtcp.mbap_byte(h, 4), 0x00)
+    test.assert_eq(mbtcp.mbap_byte(h, 5), 0x06)
+    test.assert_eq(mbtcp.mbap_byte(h, 6), 0xFF)
+
+@test
+fn test_a_protocol_identifier_that_is_not_zero_is_not_modbus() [io]
+    test.case("a field with one legal value, which sounds pointless and is not: what arrives on port 502 uninvited is rarely Modbus")
+    test.assert_eq(mbtcp.MB_TCP_PROTOCOL_ID, 0)
+    let wire: [u8] = [0x00 as u8, 0x01 as u8, 0x00 as u8, 0x01 as u8,
+                      0x00 as u8, 0x06 as u8, 0xFF as u8]
+    test.assert(refused(mbtcp.check_mbap(mbtcp.mbap_decode(wire, 0))))
+
+@test
+fn test_a_length_field_claiming_nothing_or_too_much_is_refused() [io]
+    let none: [u8] = [0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                      0x00 as u8, 0x01 as u8, 0xFF as u8]
+    test.assert(refused(mbtcp.check_mbap(mbtcp.mbap_decode(none, 0))))
+
+    let huge: [u8] = [0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                      0xFF as u8, 0xFF as u8, 0xFF as u8]
+    test.assert(refused(mbtcp.check_mbap(mbtcp.mbap_decode(huge, 0))))
+
+@test
+fn test_framing_over_tcp_is_counting_and_never_timing() [io]
+    test.case("six bytes is enough to know the rest — no silence, no delimiter, and an implementation that used RTU's timing rules over TCP is measuring gaps that mean nothing")
+    test.assert_eq(mbtcp.MB_TCP_HEADER_PREFIX, 6)
+
+    let partial: [u8] = [0x00 as u8, 0x01 as u8, 0x00 as u8]
+    test.assert(mbtcp.bytes_needed(partial, 0, 3) > 0)
+    test.assert(mbtcp.frame_complete(partial, 0, 3) == false)
+
+    let whole: [u8] = [0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                       0x00 as u8, 0x06 as u8, 0xFF as u8, 0x03 as u8,
+                       0x00 as u8, 0x00 as u8, 0x00 as u8, 0x0A as u8]
+    test.assert_eq(mbtcp.bytes_needed(whole, 0, 12), 0)
+    test.assert(mbtcp.frame_complete(whole, 0, 12))
+
+@test
+fn test_a_reply_is_paired_by_transaction_and_by_unit() [io]
+    test.case("only the first is obvious; a gateway may reuse identifiers across the devices behind it, so a client checking only the transaction accepts the wrong device's answer")
+    let q = mbtcp.mbap(7, 1, 5)
+    test.assert(mbtcp.mbap_answers(mbtcp.mbap(7, 1, 5), q))
+    test.assert(mbtcp.mbap_answers(mbtcp.mbap(8, 1, 5), q) == false)
+    test.assert(mbtcp.mbap_answers(mbtcp.mbap(7, 2, 5), q) == false)
+
+@test
+fn test_the_transaction_identifier_wraps() [io]
+    test.case("sixteen bits, and a client that treated it as monotonic breaks on the wrap")
+    test.assert_eq(mbtcp.next_transaction(0), 1)
+    test.assert_eq(mbtcp.next_transaction(65534), 65535)
+    test.assert_eq(mbtcp.next_transaction(65535), 0)
+
+@test
+fn test_the_unit_identifier_is_rtus_address_carried_through() [io]
+    test.case("a Modbus TCP endpoint is very often a gateway onto an RS-485 line, which is the only reason the field exists")
+    test.assert_eq(mbtcp.MB_TCP_UNIT_NONE, 0xFF)
+    let fwd = mbtcp.from_rtu(9, 1, 5)
+    test.assert_eq(mbtcp.mbap_unit(fwd), 1)
+    test.assert_eq(mbtcp.mbap_transaction(fwd), 9)
+    test.assert_eq(mbtcp.to_rtu_address(fwd), 1)
+
+@test
+fn test_the_not_a_gateway_unit_cannot_be_forwarded_onto_a_serial_line() [io]
+    test.case("0xFF onto RS-485 addresses a device in the reserved range that nothing will answer, so it is a configuration question rather than a frame to forward")
+    let direct = mbtcp.mbap(1, mbtcp.MB_TCP_UNIT_NONE, 5)
+    test.assert(refused(mbtcp.check_forward(direct)))
+    test.assert(refused(mbtcp.check_forward(mbtcp.mbap(1, 1, 5))) == false)
+
+// ── The CRC ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_crc_is_the_variant_and_not_a_variant() [io]
+    test.case("polynomial 0x8005 reflected, initialised 0xffff, no final xor — and its published check value over `123456789` is 0x4b37")
+    test.assert_eq(mbcrc.MB_CRC16_CHECK, 0x4B37)
+    test.assert_eq(mbcrc.crc16(bytes.from_str("123456789")), 0x4B37)
+
+@test
+fn test_a_fresh_state_is_all_ones() [io]
+    test.assert_eq(mbcrc.crc16_start(), 0xFFFF)
+
+@test
+fn test_a_byte_at_a_time_reaches_the_same_answer_as_one_call() [io]
+    test.case("the form a gateway uses: a frame's CRC is known the moment its last byte lands, with no buffer anywhere")
+    let msg = bytes.from_str("123456789")
+    test.assert_eq(mbcrc.crc16_finish(mbcrc.crc16_update(mbcrc.crc16_start(), msg)),
+                   mbcrc.crc16(msg))
+
+    var state = mbcrc.crc16_start()
+    state = mbcrc.crc16_step(state, 0x31)
+    state = mbcrc.crc16_step(state, 0x32)
+    test.assert_eq(mbcrc.crc16_finish(state), mbcrc.crc16(bytes.from_str("12")))
+
+@test
+fn test_this_algorithm_has_no_final_xor() [io]
+    test.case("so finish is the identity — it exists so a caller who knows the shape from another CRC writes the same four calls")
+    let state = mbcrc.crc16_update(mbcrc.crc16_start(),
+                                   bytes.from_str("123456789"))
+    test.assert_eq(mbcrc.crc16_finish(state), state)
+
+@test
+fn test_a_response_frame_is_built_the_same_way_as_a_request_one() [io]
+    test.case("the device side: a gateway answers into a frame with the same address and the same CRC order")
+    let r = mbpdu.read_rsp(mbpdu.MB_FC_READ_HOLDING, 4)
+    test.assert_eq(mbrtu.rsp_frame_byte(1, r, 0xC40B, 0), 1)
+    test.assert_eq(mbrtu.rsp_frame_byte(1, r, 0xC40B, 1), mbpdu.MB_FC_READ_HOLDING)
+    test.assert_eq(mbrtu.rsp_frame_byte(1, r, 0xC40B, 2), 4)
+
+@test
+fn test_the_protocol_identifier_is_read_back_off_a_header() [io]
+    test.case("a field with one legal value, and the reader is what a server checks before it treats bytes on port 502 as Modbus")
+    let h = mbtcp.mbap(1, 0xFF, 5)
+    test.assert_eq(mbtcp.mbap_protocol(h), mbtcp.MB_TCP_PROTOCOL_ID)

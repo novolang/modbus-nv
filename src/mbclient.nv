@@ -1,0 +1,381 @@
+// mbclient.nv — the client: a socket, a clock, and a retry policy.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ONE MODULE IN THIS PACKAGE THAT PERFORMS, and the manifest names
+// it in `host_modules` for that reason.  Its rows are `[net]` for the
+// socket and `[time]` for the deadline a request timeout needs.  An
+// RTU client over a serial port is NOT here: a serial port is the
+// caller's transport and `MbTransport[e]` is how it arrives, so this
+// module is Modbus TCP and the pieces every client needs whatever it
+// speaks over.
+//
+// A POLL LOOP IS WHAT A MODBUS CLIENT ACTUALLY IS.  Almost nothing
+// reads a Modbus device once: a client polls a fixed set of ranges on
+// a fixed interval, forever, over a link that drops.  So the interesting
+// parts are not `read_holding` — they are what happens when a device
+// does not answer, how many reads a poll interval can fit, and when to
+// stop retrying an address that will never exist.  `MbOptions` is
+// those decisions as a value, and `mbrtu.reply_timeout_us` is where
+// the timeout comes from rather than a number somebody picked.
+//
+// AN EXCEPTION IS NOT AN ERROR HERE EITHER.  Every request function
+// answers the response's bytes and the caller reads
+// `mbpdu.rsp_is_exception` — because a `Result` whose error is an
+// exception makes retrying a permanent refusal the natural thing to
+// write, which is the bug this package exists to make hard.
+
+use mbpdu
+use mbtcp
+use mbmap
+
+// ── The transport ────────────────────────────────────────────────────
+
+// A link a client can be driven over.
+//
+// `e` is the effect row the implementation supplies: `[net]` for a TCP
+// stream, `[io]` for a serial port, `[hw]` for a board's UART, and
+// NOTHING for a recorded conversation in a test.  That last row is why
+// the trait exists — most of a Modbus client is timing and retries,
+// and a transport that is a trait makes those tables rather than runs
+// against a device.
+pub trait MbTransport[e]
+    // Send a whole frame.  Framing is the caller's — `mbrtu` or
+    // `mbtcp` built it — so a transport moves bytes and nothing else.
+    fn mb_send(self, frame: Bytes) -> ?MbError [e]
+    // Take up to `max` bytes.  An EMPTY answer means nothing arrived
+    // inside the transport's own timeout, which is different from a
+    // closed link — and a transport that confused the two would make
+    // every quiet device look like a dropped connection.
+    fn mb_recv(self, max: Int) -> Result<Bytes, MbError> [e]
+    // Close it.  Calling this twice is not an error.
+    fn mb_close(self) -> ?MbError [e]
+    // Whether the transport believes it is open.  The one method with
+    // no effect row: a poll loop asks it every turn.
+    fn mb_is_open(self) -> Bool
+
+// ── The options ──────────────────────────────────────────────────────
+
+// What a client does when things go wrong.
+//
+// A `@value` struct of six integers, so the whole policy is one value
+// a caller can build, print and assert against before any socket
+// exists.
+pub @value
+struct MbOptions
+    // How long to wait for a reply, in milliseconds.
+    // `mbrtu.reply_timeout_us` is where the number should come from on
+    // a serial link; on TCP it is the round trip plus the device's own
+    // processing.
+    timeout_ms: Int
+    // How many times a retryable failure is retried before the request
+    // is abandoned.
+    retries: Int
+    // How long to wait before the first retry, in milliseconds.
+    backoff_ms: Int
+    // The most the backoff grows to.
+    max_backoff_ms: Int
+    // How long to leave a connection idle before closing it; 0 keeps
+    // it open forever.
+    idle_close_ms: Int
+    // The unit identifier to address, for a gateway.
+    unit: Int
+
+// The default options: a one-second timeout, three retries, a
+// hundred-millisecond backoff doubling to two seconds, no idle close,
+// and unit 0xFF.
+//
+// ```novo
+// use mbclient
+//
+// fn main() [io]
+//     println("${mbclient.timeout_ms(mbclient.default_options())}")   // 1000
+// ```
+pub fn default_options() -> MbOptions []
+    todo("modbus-nv.mbclient.default_options")
+
+// Build options.
+pub fn options(timeout_ms: Int, retries: Int, backoff_ms: Int, max_backoff_ms: Int,
+               idle_close_ms: Int, unit: Int) -> MbOptions []
+    todo("modbus-nv.mbclient.options")
+
+// The reply timeout.
+pub fn timeout_ms(o: MbOptions) -> Int []
+    todo("modbus-nv.mbclient.timeout_ms")
+
+// How many retries.
+pub fn retries(o: MbOptions) -> Int []
+    todo("modbus-nv.mbclient.retries")
+
+// The first backoff.
+pub fn backoff_ms(o: MbOptions) -> Int []
+    todo("modbus-nv.mbclient.backoff_ms")
+
+// The unit identifier.
+pub fn unit(o: MbOptions) -> Int []
+    todo("modbus-nv.mbclient.unit")
+
+// The same options with a different unit, for a caller polling several
+// devices behind one gateway.
+pub fn with_unit(o: MbOptions, unit: Int) -> MbOptions []
+    todo("modbus-nv.mbclient.with_unit")
+
+// How long to wait before retry number `n`, in milliseconds.
+//
+// The backoff doubling, capped.  A number rather than a sleep, because
+// a caller with its own scheduler does not want one — and because a
+// table of the first five values is a test where a run against a dead
+// device is not.
+//
+// ```novo
+// use mbclient
+//
+// fn main() [io]
+//     let o = mbclient.default_options()
+//     println("${mbclient.backoff_for(o, 0)}")   // 100
+//     println("${mbclient.backoff_for(o, 2)}")   // 400
+// ```
+pub fn backoff_for(o: MbOptions, n: Int) -> Int []
+    todo("modbus-nv.mbclient.backoff_for")
+
+// Whether a failure at attempt `n` should be retried under these
+// options.
+//
+// BOTH conditions: the fault has to be retryable AND there have to be
+// attempts left.  A client with either half missing either gives up on
+// a dropped packet or loops forever on a bad address.
+pub fn should_retry(o: MbOptions, e: MbError, n: Int) -> Bool []
+    todo("modbus-nv.mbclient.should_retry")
+
+// Whether an EXCEPTION should be retried under these options.
+//
+// A separate question from `should_retry`, deliberately: only
+// `MB_EX_ACKNOWLEDGE` and `MB_EX_SERVER_BUSY` are worth another
+// attempt, and everything else is a device saying no in a way that
+// will not change.  A client that fed exceptions into the transport
+// retry path retries an illegal address until its operator notices.
+pub fn should_retry_exception(o: MbOptions, exception: Int, n: Int) -> Bool []
+    todo("modbus-nv.mbclient.should_retry_exception")
+
+// ── The connection ───────────────────────────────────────────────────
+
+// An open Modbus TCP connection.
+//
+// The socket, the options, and the transaction counter — which has to
+// live somewhere and belongs with the connection, because it is the
+// connection that has several requests outstanding.
+//
+// THE OPTIONS ARE SIX FLAT FIELDS AND NOT AN `MbOptions`.  A boxed
+// struct stores pointer-shaped slots, so a `@value` struct cannot be
+// one of its fields (E2015) — `client_options` assembles one on
+// demand, which costs a caller one call and keeps `MbOptions` unboxed
+// where it matters, in the retry arithmetic a poll loop runs every
+// turn.
+pub struct MbClient
+    // The socket handle.
+    socket: Int
+    // The host it is connected to.
+    host: Str
+    // The port.
+    port: Int
+    // The next transaction identifier.
+    transaction: Int
+    // The reply timeout in force, in milliseconds.
+    timeout_ms: Int
+    // How many retries a request gets.
+    retries: Int
+    // The first backoff, in milliseconds.
+    backoff_ms: Int
+    // The backoff ceiling.
+    max_backoff_ms: Int
+    // How long an idle connection is kept, or 0 forever.
+    idle_close_ms: Int
+    // The unit identifier addressed.
+    unit: Int
+
+// Connect to a Modbus TCP server.
+//
+// `[net]` — the socket, and nothing else.  Port 502 is the
+// conventional one and `MB_TCP_PORT` is it.
+//
+// ```novo
+// use mbclient
+// use mbtcp
+//
+// fn main() [io, net, time]
+//     match mbclient.connect("192.0.2.1", mbtcp.MB_TCP_PORT,
+//                            mbclient.default_options())
+//         Ok(_)  => println("connected")
+//         Err(e) => println(e.message())
+// ```
+pub fn connect(host: Str, port: Int, o: MbOptions) -> Result<MbClient, MbError> [net]
+    todo("modbus-nv.mbclient.connect")
+
+// Close a connection.  Calling this twice is not an error.
+pub fn close(c: MbClient) -> ?MbError [net]
+    todo("modbus-nv.mbclient.close")
+
+// The host.
+pub fn client_host(c: MbClient) -> Str [net]
+    todo("modbus-nv.mbclient.client_host")
+
+// The options in force, assembled from the six flat fields.
+pub fn client_options(c: MbClient) -> MbOptions [net]
+    todo("modbus-nv.mbclient.client_options")
+
+// The next transaction identifier this connection will use.
+pub fn client_transaction(c: MbClient) -> Int [net]
+    todo("modbus-nv.mbclient.client_transaction")
+
+// ── The requests ─────────────────────────────────────────────────────
+
+// Read `count` holding registers from `start`.
+//
+// `[net, time]` — the socket and the deadline.  The answer is the
+// response's data bytes, big-endian, two per register; `mbmap.reg_at`
+// reads one out.
+//
+// AN EXCEPTION IS NOT AN ERROR.  A device that refuses answers a
+// response with an exception code, and this returns it as a successful
+// exchange — the caller asks `mbpdu.rsp_is_exception`.  A `Result`
+// whose error was an exception would make retrying a permanent refusal
+// the natural thing to write.
+pub fn read_holding(c: MbClient, start: Int, count: Int) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.read_holding")
+
+// Read `count` input registers.
+pub fn read_input(c: MbClient, start: Int, count: Int) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.read_input")
+
+// Read `count` coils, packed eight to a byte, least significant bit
+// first.
+pub fn read_coils(c: MbClient, start: Int, count: Int) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.read_coils")
+
+// Read `count` discrete inputs.
+pub fn read_discrete(c: MbClient, start: Int, count: Int) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.read_discrete")
+
+// Write one holding register.
+pub fn write_holding(c: MbClient, address: Int, value: Int) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.write_holding")
+
+// Write one coil, on or off.
+//
+// A `Bool` rather than the wire's 0xFF00 and 0x0000, because those two
+// are the only legal values and a caller should not be able to write a
+// third.
+pub fn write_coil(c: MbClient, address: Int, on: Bool) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.write_coil")
+
+// Write several holding registers from big-endian words.
+pub fn write_holdings(c: MbClient, start: Int, count: Int,
+                      data: Bytes) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.write_holdings")
+
+// Write several coils from packed bits.
+pub fn write_coils(c: MbClient, start: Int, count: Int,
+                   data: Bytes) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.write_coils")
+
+// Read one range and write another in one transaction.
+//
+// The read happens FIRST, which is the specification's rule: a caller
+// that expected the written values back reads what was there before.
+pub fn read_write_holdings(c: MbClient, read_start: Int, read_count: Int, write_start: Int,
+                           write_count: Int, data: Bytes) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.read_write_holdings")
+
+// Send an arbitrary request and take the response's bytes.
+//
+// The escape hatch, and the one the eight above are written over: a
+// device with a vendor function code, or a client that built a request
+// from a configuration file, has somewhere to go.
+pub fn request(c: MbClient, q: MbReq, data: Bytes) -> Result<Bytes, MbError> [net, time]
+    todo("modbus-nv.mbclient.request")
+
+// The response header of the last request, which carries the exception
+// code.
+//
+// Separate from the data because a `@value` struct cannot be part of a
+// `Result` (E2015) — the same constraint every other fallible pair in
+// this package meets, and the reason the exception is read rather than
+// returned.
+pub fn last_response(c: MbClient) -> MbRsp [net]
+    todo("modbus-nv.mbclient.last_response")
+
+// ── Over any transport ───────────────────────────────────────────────
+
+// Send a request over a caller's transport and take the response's
+// bytes.
+//
+// `[e]` — the cost is the transport's.  This is the whole of a Modbus
+// exchange with no socket in it, so an RTU client over a serial port,
+// a client over a radio link and a client in a test all use the same
+// function and the same retry arithmetic.
+pub fn exchange<T: MbTransport[e]>(t: T, o: MbOptions, q: MbReq,
+                                   data: Bytes) -> Result<Bytes, MbError> [e]
+    todo("modbus-nv.mbclient.exchange")
+
+// Send a request over a transport as an RTU frame, with the CRC the
+// caller computed.
+//
+// The CRC is the caller's for the same reason it is everywhere else:
+// `mbcrc` is the bridge, and a gateway with a CRC peripheral passes
+// its hardware's answer in.
+pub fn exchange_rtu<T: MbTransport[e]>(t: T, o: MbOptions, address: Int, q: MbReq, data: Bytes,
+                                       crc: Int) -> Result<Bytes, MbError> [e]
+    todo("modbus-nv.mbclient.exchange_rtu")
+
+// ── Polling ──────────────────────────────────────────────────────────
+
+// How many requests of `req_len` bytes answered with `rsp_len` fit one
+// poll interval on a serial line at this baud rate.
+//
+// The number that decides whether a poll loop is feasible at all, and
+// the one that is discovered late: at 9600 baud a 125-register read
+// and its reply take about 300 ms, so a one-second interval fits
+// three — and a configuration asking for twenty has been wrong since
+// it was written.
+//
+// ```novo
+// use mbclient
+//
+// fn main() [io]
+//     println("${mbclient.requests_per_interval(8, 9, 9600, 1000)}")
+// ```
+pub fn requests_per_interval(req_len: Int, rsp_len: Int, baud: Int, interval_ms: Int) -> Int []
+    todo("modbus-nv.mbclient.requests_per_interval")
+
+// Whether a poll schedule fits its interval, given the same numbers.
+//
+// The refusal beside it: a schedule that does not fit does not fail —
+// it drifts, so the last device in the list is polled less and less
+// often and nothing anywhere reports it.
+pub fn schedule_fits(requests: Int, req_len: Int, rsp_len: Int, baud: Int,
+                     interval_ms: Int) -> Bool []
+    todo("modbus-nv.mbclient.schedule_fits")
+
+// How many reads a range of `count` registers takes, given the
+// per-read limit.
+//
+// A client asking for 500 holding registers is asking for four reads,
+// and splitting them is the caller's job — this says how many and
+// `split_start` says where each begins.
+//
+// ```novo
+// use mbclient
+//
+// fn main() [io]
+//     println("${mbclient.split_count(500, 125)}")   // 4
+// ```
+pub fn split_count(count: Int, limit: Int) -> Int []
+    todo("modbus-nv.mbclient.split_count")
+
+// Where read `n` of a split begins.
+pub fn split_start(start: Int, n: Int, limit: Int) -> Int []
+    todo("modbus-nv.mbclient.split_start")
+
+// How many units read `n` of a split covers — the last one is short.
+pub fn split_len(count: Int, n: Int, limit: Int) -> Int []
+    todo("modbus-nv.mbclient.split_len")

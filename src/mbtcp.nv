@@ -1,0 +1,268 @@
+// mbtcp.nv — the MBAP header: the same protocol data unit, with a
+// different envelope.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SEVEN BYTES REPLACE THE ADDRESS AND THE CRC, and each of the three
+// substitutions is worth stating because each is a thing a reader
+// coming from RTU will get wrong:
+//
+//   * the CRC is gone, because TCP checksums the stream already — a
+//     Modbus TCP frame with a CRC in it is a frame with two extra
+//     bytes of payload that every server reads as data;
+//   * the length field replaces the silence, so framing is counting
+//     rather than timing, and an implementation over TCP never needs a
+//     microsecond timer at all;
+//   * and the TRANSACTION IDENTIFIER is new, and it is what makes TCP
+//     genuinely different: a client may have several requests
+//     outstanding on one connection, and replies may come back in any
+//     order.  RTU's one-at-a-time discipline comes from the wire; TCP
+//     has no such rule, and a client that assumed the next reply
+//     answers the last request eventually pairs a response with the
+//     wrong one.
+//
+// THE UNIT IDENTIFIER IS NOT AN IP ADDRESS.  It is RTU's unit address,
+// carried through because a Modbus TCP endpoint is very often a
+// GATEWAY onto an RS-485 line rather than a device: the transaction
+// identifier addresses the conversation and the unit identifier
+// addresses the device behind the gateway.  A client talking to a
+// device directly sends 0xFF, which is the conventional "not a
+// gateway" value and is not in the specification as a requirement —
+// which is why `MB_TCP_UNIT_NONE` is here with that said.
+//
+// THE PROTOCOL DATA UNIT IS UNCHANGED, and that is the point of the
+// split: `mbpdu` is the whole of Modbus and these two modules are
+// envelopes.  A gateway decodes one and re-encodes the other without
+// touching what is inside.
+
+// ── The header ───────────────────────────────────────────────────────
+
+// How many bytes an MBAP header occupies: 7.
+pub const MB_MBAP_LEN = 7
+
+// The protocol identifier Modbus uses: 0.
+//
+// A field with one legal value, which sounds pointless and is not: a
+// server that does not check it accepts anything on port 502 as
+// Modbus, and what arrives on port 502 uninvited is rarely Modbus.
+pub const MB_TCP_PROTOCOL_ID = 0
+
+// The conventional unit identifier for a device addressed directly
+// rather than through a gateway: 0xFF.
+//
+// A convention rather than a rule, and this package says which it is:
+// many devices accept anything, some accept only 0xFF, and some accept
+// only their own configured address.  A client with a connection
+// problem to an unfamiliar device should try 1 and 0xFF before
+// anything else.
+pub const MB_TCP_UNIT_NONE = 0xFF
+
+// The port Modbus TCP listens on: 502.
+pub const MB_TCP_PORT = 502
+
+// The application protocol header.
+pub @value
+struct MbMbap
+    // The transaction identifier, echoed by the server.  What pairs a
+    // reply with its request on a connection carrying several at once.
+    transaction: Int
+    // The protocol identifier, which is 0 and nothing else.
+    protocol: Int
+    // How many bytes follow this field: the unit identifier plus the
+    // protocol data unit.  ONE more than the unit's length, which is
+    // the off-by-one every first implementation makes.
+    length: Int
+    // The unit identifier — RTU's address, carried through for a
+    // gateway.
+    unit: Int
+
+// Build a header for a protocol data unit of `pdu_len` bytes.
+//
+// The length field is computed rather than passed, because it is the
+// one field with a right answer and the one an implementation gets
+// wrong: it counts the unit identifier as well as the protocol data
+// unit, so it is `pdu_len + 1` and not `pdu_len`.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     let h = mbtcp.mbap(1, mbtcp.MB_TCP_UNIT_NONE, 5)
+//     println("${mbtcp.mbap_length(h)}")   // 6
+// ```
+pub fn mbap(transaction: Int, unit: Int, pdu_len: Int) -> MbMbap []
+    todo("modbus-nv.mbtcp.mbap")
+
+// The transaction identifier.
+pub fn mbap_transaction(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.mbap_transaction")
+
+// The protocol identifier.
+pub fn mbap_protocol(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.mbap_protocol")
+
+// The length field.
+pub fn mbap_length(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.mbap_length")
+
+// The unit identifier.
+pub fn mbap_unit(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.mbap_unit")
+
+// How many bytes of protocol data unit the header says follow it.
+//
+// The length field minus one, and having it as a function is what
+// stops the off-by-one being written twice in opposite directions.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     println("${mbtcp.mbap_pdu_len(mbtcp.mbap(1, 255, 5))}")   // 5
+// ```
+pub fn mbap_pdu_len(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.mbap_pdu_len")
+
+// The `i`-th of the seven wire bytes, big-endian — which is the whole
+// header, since Modbus TCP has no little-endian field at all.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     let h = mbtcp.mbap(0x1234, 255, 5)
+//     println("${mbtcp.mbap_byte(h, 0)}")   // 18, which is 0x12
+// ```
+pub fn mbap_byte(h: MbMbap, i: Int) -> Int []
+    todo("modbus-nv.mbtcp.mbap_byte")
+
+// Decode a header from the seven bytes at `off`.
+//
+// Answers a zeroed header when fewer than seven bytes are available,
+// because a `@value` struct cannot be a `Result` payload (E2015);
+// `check_mbap` is the refusal beside it.
+pub fn mbap_decode(buf: [u8], off: Int) -> MbMbap []
+    todo("modbus-nv.mbtcp.mbap_decode")
+
+// Why a header cannot be acted on, or nothing.
+//
+// A protocol identifier that is not 0, a length field of 0 or 1 — no
+// protocol data unit at all — or one claiming more than the 253-byte
+// ceiling the serial framing imposed on everything.
+pub fn check_mbap(h: MbMbap) -> ?MbError []
+    todo("modbus-nv.mbtcp.check_mbap")
+
+// ── Framing by counting ──────────────────────────────────────────────
+
+// How long a whole Modbus TCP frame carrying `pdu_len` bytes is.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     println("${mbtcp.frame_len(5)}")   // 12
+// ```
+pub fn frame_len(pdu_len: Int) -> Int []
+    todo("modbus-nv.mbtcp.frame_len")
+
+// The largest Modbus TCP frame: 260 bytes.
+//
+// Seven of header and 253 of protocol data unit — the serial framing's
+// ceiling, inherited.
+pub const MB_TCP_MAX_FRAME = 260
+
+// How many bytes a receiver needs before it can work out how long the
+// frame is: 6.
+//
+// The length field ends at offset 5, so six bytes is enough — and that
+// is the whole of framing over TCP.  No timing, no delimiter, no
+// silence: a receiver reads six bytes, learns the rest, and reads
+// exactly that many.  An implementation that used RTU's timing rules
+// over TCP is measuring gaps that mean nothing.
+pub const MB_TCP_HEADER_PREFIX = 6
+
+// How many more bytes a receiver needs, given what it already has.
+//
+// The whole of a Modbus TCP receive loop: ask, read, ask again.
+// Answers 0 when a complete frame is present and a positive number
+// otherwise.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     println("${mbtcp.MB_TCP_HEADER_PREFIX}")   // 6
+// ```
+pub fn bytes_needed(buf: [u8], off: Int, have: Int) -> Int []
+    todo("modbus-nv.mbtcp.bytes_needed")
+
+// Whether the bytes at `off` hold at least one complete frame.
+pub fn frame_complete(buf: [u8], off: Int, have: Int) -> Bool []
+    todo("modbus-nv.mbtcp.frame_complete")
+
+// Where the protocol data unit begins inside a frame: 7.
+pub fn pdu_offset() -> Int []
+    todo("modbus-nv.mbtcp.pdu_offset")
+
+// ── Pairing a reply with its request ─────────────────────────────────
+
+// Whether a reply's header answers a request's.
+//
+// The transaction identifier AND the unit identifier both have to
+// match.  Only the first is obvious; the second matters for a gateway,
+// where two devices behind one connection can be asked the same thing
+// and a client that checked only the transaction would accept either
+// answer — which, since a gateway may reuse transaction identifiers
+// across units, is a real pairing and a wrong one.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     let q = mbtcp.mbap(7, 1, 5)
+//     let r = mbtcp.mbap(7, 1, 5)
+//     println("${mbtcp.mbap_answers(r, q)}")   // true
+// ```
+pub fn mbap_answers(r: MbMbap, q: MbMbap) -> Bool []
+    todo("modbus-nv.mbtcp.mbap_answers")
+
+// The next transaction identifier after this one, wrapping at 65536.
+//
+// Sixteen bits, so a long-lived connection wraps — which is fine, and
+// is fine only because a client with several requests outstanding has
+// far fewer than 65536 of them.  A client that treated the identifier
+// as monotonic would break on the wrap.
+//
+// ```novo
+// use mbtcp
+//
+// fn main() [io]
+//     println("${mbtcp.next_transaction(65535)}")   // 0
+// ```
+pub fn next_transaction(transaction: Int) -> Int []
+    todo("modbus-nv.mbtcp.next_transaction")
+
+// ── The RTU bridge ───────────────────────────────────────────────────
+
+// The header a gateway builds when it forwards an RTU frame onto TCP.
+//
+// The unit identifier is the RTU address, unchanged; the transaction
+// identifier is the gateway's own.  One line, and it is here because a
+// gateway is the reason both envelopes exist in one package.
+pub fn from_rtu(transaction: Int, rtu_address: Int, pdu_len: Int) -> MbMbap []
+    todo("modbus-nv.mbtcp.from_rtu")
+
+// The RTU address a gateway uses when it forwards this header onto a
+// serial line.
+//
+// The unit identifier, with one substitution: `MB_TCP_UNIT_NONE` means
+// "not a gateway", and forwarding it onto RS-485 as address 255 would
+// address a device in the reserved range that nothing will answer.  A
+// gateway that meets it has a configuration question rather than a
+// frame to forward, and `check_forward` is the refusal.
+pub fn to_rtu_address(h: MbMbap) -> Int []
+    todo("modbus-nv.mbtcp.to_rtu_address")
+
+// Why a TCP frame cannot be forwarded onto a serial line, or nothing.
+pub fn check_forward(h: MbMbap) -> ?MbError []
+    todo("modbus-nv.mbtcp.check_forward")

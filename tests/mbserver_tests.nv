@@ -1,0 +1,310 @@
+// mbserver_tests.nv — the address map, the handler, and the errors.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: modbus-nv.<module>.<fn>`.
+//
+// THIS FILE IS THE ARGUMENT FOR `MbHandler[e]`.  The bench below
+// implements it with every method declaring `[]`, so a whole server's
+// request handling — the range checks, the exception decisions, the
+// packing — is exercisable with no device, no socket and no
+// permissions.  That is why `mbmap` is in a `core` package despite
+// being the server half, and it is what lets a gateway's protocol
+// behaviour be a table rather than a run against a PLC.
+
+use std.test
+use mbmap
+use mbpdu
+use mberr
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?MbError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+// A device with nothing behind it.
+//
+// Every method declares `[]`, so every `mbmap` function driven through
+// it is `[]` too.  A real handler over a board's ADC declares `[hw]`
+// and an in-memory one `[mutate]`, and the same call sites are charged
+// that instead.
+struct MbBench
+    busy: Bool
+
+impl MbHandler[] for MbBench
+    fn mb_read_coils(self, address: Int, count: Int) -> Result<Bytes, MbError> []
+        Ok(bytes.zeros(mbmap.bits_to_bytes(count)))
+
+    fn mb_read_discrete(self, address: Int, count: Int) -> Result<Bytes, MbError> []
+        Ok(bytes.zeros(mbmap.bits_to_bytes(count)))
+
+    fn mb_read_holding(self, address: Int, count: Int) -> Result<Bytes, MbError> []
+        Ok(bytes.zeros(mbmap.regs_to_bytes(count)))
+
+    fn mb_read_input(self, address: Int, count: Int) -> Result<Bytes, MbError> []
+        Ok(bytes.zeros(mbmap.regs_to_bytes(count)))
+
+    fn mb_write_coils(self, address: Int, count: Int, data: Bytes) -> ?MbError []
+        None
+
+    fn mb_write_holding(self, address: Int, count: Int, data: Bytes) -> ?MbError []
+        None
+
+    fn mb_is_busy(self) -> Bool
+        self.busy
+
+fn bench() -> MbBench
+    MbBench { busy: false }
+
+fn nominal() -> MbRegMap
+    mbmap.reg_map(0, 8, 0, 16, 0, 64, 0, 32)
+
+@test
+fn test_the_four_spaces_are_what_the_function_codes_address() [io]
+    test.assert_eq(mbmap.space_of(mbpdu.MB_FC_READ_COILS), mbmap.MB_SPACE_COIL)
+    test.assert_eq(mbmap.space_of(mbpdu.MB_FC_READ_DISCRETE_INPUTS),
+                   mbmap.MB_SPACE_DISCRETE)
+    test.assert_eq(mbmap.space_of(mbpdu.MB_FC_READ_HOLDING),
+                   mbmap.MB_SPACE_HOLDING)
+    test.assert_eq(mbmap.space_of(mbpdu.MB_FC_READ_INPUT), mbmap.MB_SPACE_INPUT)
+    test.assert_eq(mbmap.space_of(mbpdu.MB_FC_WRITE_SINGLE_COIL),
+                   mbmap.MB_SPACE_COIL)
+
+@test
+fn test_two_of_the_four_spaces_cannot_be_written_at_all() [io]
+    test.case("not a policy a device chooses: there is no function code that writes them, so a server accepting one accepted a request nothing could have sent")
+    test.assert(mbmap.space_is_writable(mbmap.MB_SPACE_COIL))
+    test.assert(mbmap.space_is_writable(mbmap.MB_SPACE_HOLDING))
+    test.assert(mbmap.space_is_writable(mbmap.MB_SPACE_DISCRETE) == false)
+    test.assert(mbmap.space_is_writable(mbmap.MB_SPACE_INPUT) == false)
+
+@test
+fn test_two_of_the_four_hold_bits() [io]
+    test.assert(mbmap.space_is_bits(mbmap.MB_SPACE_COIL))
+    test.assert(mbmap.space_is_bits(mbmap.MB_SPACE_DISCRETE))
+    test.assert(mbmap.space_is_bits(mbmap.MB_SPACE_HOLDING) == false)
+    test.assert(mbmap.space_is_bits(mbmap.MB_SPACE_INPUT) == false)
+
+@test
+fn test_function_twenty_three_writes_holding_registers_too() [io]
+    test.case("its own function, because 23 reads holding registers AND writes them at a different address, so one answer cannot serve both halves")
+    test.assert_eq(mbmap.write_space_of(mbpdu.MB_FC_READ_WRITE_MULTIPLE),
+                   mbmap.MB_SPACE_HOLDING)
+
+@test
+fn test_a_map_says_what_exists_and_a_count_of_zero_means_it_does_not() [io]
+    let m = nominal()
+    test.assert_eq(mbmap.space_count(m, mbmap.MB_SPACE_COIL), 8)
+    test.assert_eq(mbmap.space_count(m, mbmap.MB_SPACE_HOLDING), 64)
+    test.assert_eq(mbmap.space_last(m, mbmap.MB_SPACE_HOLDING), 63)
+    test.assert(mbmap.space_exists(m, mbmap.MB_SPACE_COIL))
+
+    let h = mbmap.holding_only(0, 64)
+    test.assert(mbmap.space_exists(h, mbmap.MB_SPACE_COIL) == false)
+    test.assert_eq(mbmap.space_count(h, mbmap.MB_SPACE_COIL), 0)
+    test.assert_eq(mbmap.space_last(h, mbmap.MB_SPACE_COIL), 0 - 1)
+
+@test
+fn test_an_empty_map_refuses_everything() [io]
+    test.case("the safe default: better exception 2 to every request than reading whatever a handler returns for an address nobody configured")
+    let m = mbmap.empty_map()
+    test.assert(mbmap.serves(m, mbpdu.read_req(3, 0, 1)) == false)
+    test.assert(mbmap.serves(m, mbpdu.read_req(1, 0, 1)) == false)
+
+@test
+fn test_the_whole_range_has_to_exist_and_not_just_its_start() [io]
+    test.case("Modbus has no partial answer: a read that runs off the end is refused entirely, and a server returning what it had hands its client zeros indistinguishable from measurements")
+    let m = mbmap.holding_only(0, 64)
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 0, 64))
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 60, 4))
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 60, 5) == false)
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 63, 1))
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 64, 1) == false)
+
+@test
+fn test_a_map_with_a_base_above_zero_excludes_what_is_below_it() [io]
+    let m = mbmap.reg_map(0, 0, 0, 0, 40, 25, 0, 0)
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 40, 25))
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 39, 1) == false)
+    test.assert(mbmap.covers(m, mbmap.MB_SPACE_HOLDING, 64, 1) == false)
+    test.assert_eq(mbmap.space_last(m, mbmap.MB_SPACE_HOLDING), 64)
+
+@test
+fn test_the_range_check_is_made_once_for_a_whole_request() [io]
+    test.case("so a handler never range-checks and cannot get the off-by-one wrong in one of four places")
+    let m = mbmap.holding_only(0, 64)
+    test.assert(mbmap.serves(m, mbpdu.read_req(3, 0, 10)))
+    test.assert(mbmap.serves(m, mbpdu.read_req(3, 60, 10)) == false)
+    test.assert(refused(mbmap.check_serves(m, mbpdu.read_req(3, 60, 10))))
+
+@test
+fn test_both_halves_of_function_twenty_three_are_checked() [io]
+    let m = mbmap.holding_only(0, 64)
+    test.assert(mbmap.serves(m, mbpdu.read_write_req(0, 10, 20, 5)))
+    test.assert(mbmap.serves(m, mbpdu.read_write_req(0, 10, 60, 10)) == false)
+    test.assert(mbmap.serves(m, mbpdu.read_write_req(60, 10, 0, 5)) == false)
+
+@test
+fn test_a_missing_range_and_a_missing_space_are_different_exceptions() [io]
+    test.case("`this address does not exist` sends a client to its configuration; `this device does not do coils` sends it to the manual")
+    let m = mbmap.holding_only(0, 64)
+    test.assert_eq(mbmap.exception_for(m, mbpdu.read_req(3, 60, 10)),
+                   mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+    test.assert_eq(mbmap.exception_for(m, mbpdu.read_req(1, 0, 1)),
+                   mbpdu.MB_EX_ILLEGAL_FUNCTION)
+    test.assert_eq(mbmap.exception_for(m, mbpdu.read_req(3, 0, 10)), 0)
+
+@test
+fn test_an_offset_is_what_a_handler_indexes_its_own_storage_with() [io]
+    test.case("a device whose holding registers start at 40 on the wire has them at 0 in its array, and doing that subtraction here stops it being done twice")
+    let m = mbmap.reg_map(0, 0, 0, 0, 40, 25, 0, 0)
+    test.assert_eq(mbmap.offset_in(m, mbmap.MB_SPACE_HOLDING, 40), 0)
+    test.assert_eq(mbmap.offset_in(m, mbmap.MB_SPACE_HOLDING, 64), 24)
+    test.assert_eq(mbmap.offset_in(m, mbmap.MB_SPACE_HOLDING, 39), 0 - 1)
+    test.assert_eq(mbmap.offset_in(m, mbmap.MB_SPACE_HOLDING, 65), 0 - 1)
+
+@test
+fn test_a_handler_that_performs_nothing_makes_a_whole_server_free() [io]
+    test.case("the property the effect parameter exists for: a gateway's protocol behaviour is a table rather than a run against a PLC")
+    let h = bench()
+    let m = nominal()
+    match mbmap.serve(h, m, mbpdu.read_req(3, 0, 10))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_response_header_comes_from_the_map_and_the_request() [io]
+    test.case("separate from serve because a @value struct cannot be part of a Result (E2015)")
+    let m = nominal()
+    let r = mbmap.response_for(m, mbpdu.read_req(3, 0, 10))
+    test.assert_eq(mbpdu.rsp_byte_count(r), 20)
+    test.assert(mbpdu.rsp_is_exception(r) == false)
+
+    test.case("and a request the map cannot serve produces an exception response rather than a header for data that does not exist")
+    let bad = mbmap.response_for(m, mbpdu.read_req(3, 60, 10))
+    test.assert(mbpdu.rsp_is_exception(bad))
+    test.assert_eq(mbpdu.rsp_exception(bad), mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+
+@test
+fn test_a_busy_device_usually_still_answers_a_read() [io]
+    test.case("a policy rather than a rule, so it is a named function a server can ignore rather than behaviour buried in serve")
+    test.assert(mbmap.busy_refuses(mbpdu.write_single_req(6, 0, 1)))
+    test.assert(mbmap.busy_refuses(mbpdu.read_req(3, 0, 10)) == false)
+
+@test
+fn test_bits_pack_eight_to_a_byte_least_significant_first() [io]
+    test.case("the protocol's own order, and the opposite of how a person writes a bit pattern down — an implementation that packed them the readable way reverses coils in groups of eight")
+    test.assert_eq(mbmap.bits_to_bytes(1), 1)
+    test.assert_eq(mbmap.bits_to_bytes(8), 1)
+    test.assert_eq(mbmap.bits_to_bytes(9), 2)
+    test.assert_eq(mbmap.bits_to_bytes(0), 0)
+
+    test.assert_eq(mbmap.bit_byte_index(0), 0)
+    test.assert_eq(mbmap.bit_byte_index(7), 0)
+    test.assert_eq(mbmap.bit_byte_index(8), 1)
+    test.assert_eq(mbmap.bit_in_byte(0), 0)
+    test.assert_eq(mbmap.bit_in_byte(7), 7)
+    test.assert_eq(mbmap.bit_in_byte(8), 0)
+
+@test
+fn test_registers_are_two_big_endian_bytes_each() [io]
+    test.assert_eq(mbmap.regs_to_bytes(10), 20)
+    test.assert_eq(mbmap.reg_high_byte(0x1234), 0x12)
+    test.assert_eq(mbmap.reg_low_byte(0x1234), 0x34)
+
+    // Two registers as four big-endian bytes, taken from a string so
+    // the literal is readable: 0x12 0x34 0x56 0x78.
+    let data = bytes.from_str("\x12\x34\x56\x78")
+    test.assert_eq(mbmap.reg_at(data, 0), 0x1234)
+    test.assert_eq(mbmap.reg_at(data, 1), 0x5678)
+
+@test
+fn test_a_bit_is_read_back_out_of_a_packed_run() [io]
+    // 0x05 is bits 0 and 2 set, which is coils 1 and 3 on.
+    let data = bytes.from_str("\x05")
+    test.assert(mbmap.bit_at(data, 0))
+    test.assert(mbmap.bit_at(data, 1) == false)
+    test.assert(mbmap.bit_at(data, 2))
+
+@test
+fn test_the_wire_address_and_the_manuals_number_are_not_the_same() [io]
+    test.case("manuals count from 1 and the wire counts from 0, and vendors differ about whether the leading digit is part of the number — so this package converts rather than guesses")
+    test.assert_eq(mbmap.wire_from_manual(1, false), 0)
+    test.assert_eq(mbmap.wire_from_manual(40001, true), 0)
+    test.assert_eq(mbmap.wire_from_manual(40011, true), 10)
+
+    test.assert_eq(mbmap.manual_from_wire(0, mbmap.MB_SPACE_HOLDING, false), 1)
+    test.assert_eq(mbmap.manual_from_wire(0, mbmap.MB_SPACE_HOLDING, true), 40001)
+    test.assert_eq(mbmap.manual_from_wire(0, mbmap.MB_SPACE_COIL, true), 1)
+
+@test
+fn test_every_space_has_a_name() [io]
+    test.assert(str.len(mbmap.space_name(mbmap.MB_SPACE_HOLDING)) > 0)
+    test.assert(mbmap.space_name(mbmap.MB_SPACE_HOLDING)
+                != mbmap.space_name(mbmap.MB_SPACE_INPUT))
+
+@test
+fn test_a_map_can_be_edited_one_space_at_a_time() [io]
+    let m = mbmap.with_space(mbmap.empty_map(), mbmap.MB_SPACE_HOLDING, 0, 64)
+    test.assert_eq(mbmap.space_count(m, mbmap.MB_SPACE_HOLDING), 64)
+    test.assert_eq(mbmap.space_base(m, mbmap.MB_SPACE_HOLDING), 0)
+    test.assert(mbmap.space_exists(m, mbmap.MB_SPACE_COIL) == false)
+
+// ── The errors ───────────────────────────────────────────────────────
+
+@test
+fn test_there_is_no_exception_variant_in_the_error_type() [io]
+    test.case("the variant that is NOT here is the point of the type: an exception is a successful exchange and belongs on the response")
+    test.assert(str.len(mberr.describe(MbTimedOut(1000))) > 0)
+    test.assert(str.len(mberr.describe(MbBadCrc(0xC40B, 0x1234))) > 0)
+    test.assert(str.len(mberr.describe(MbShortFrame(8, 5))) > 0)
+    test.assert(str.len(mberr.describe(MbFrameTooLong(300))) > 0)
+    test.assert(str.len(mberr.describe(MbWrongFunction(3, 4))) > 0)
+    test.assert(str.len(mberr.describe(MbByteCountMismatch(20, 18))) > 0)
+    test.assert(str.len(mberr.describe(MbWrongTransaction(7, 8))) > 0)
+    test.assert(str.len(mberr.describe(MbWrongUnit(1, 2))) > 0)
+    test.assert(str.len(mberr.describe(MbNotModbus(1))) > 0)
+    test.assert(str.len(mberr.describe(MbCountTooLarge(3, 126, 125))) > 0)
+    test.assert(str.len(mberr.describe(MbAddressTooLarge(65536))) > 0)
+    test.assert(str.len(mberr.describe(MbUnsupportedFunction(99))) > 0)
+    test.assert(str.len(mberr.describe(MbBadCoilValue(1))) > 0)
+    test.assert(str.len(mberr.describe(MbBadUnitAddress(248))) > 0)
+    test.assert(str.len(mberr.describe(MbBroadcastHasNoReply)) > 0)
+    test.assert(str.len(mberr.describe(MbTransportFailed("connection refused"))) > 0)
+    test.assert(str.len(mberr.describe(MbNotInMap(60, 10))) > 0)
+
+@test
+fn test_a_transport_fault_is_worth_retrying_and_a_value_fault_is_not() [io]
+    test.assert(mberr.is_retryable(MbTimedOut(1000)))
+    test.assert(mberr.is_retryable(MbBadCrc(1, 2)))
+    test.assert(mberr.is_retryable(MbShortFrame(8, 5)))
+    test.assert(mberr.is_retryable(MbCountTooLarge(3, 126, 125)) == false)
+    test.assert(mberr.is_retryable(MbUnsupportedFunction(99)) == false)
+    test.assert(mberr.is_retryable(MbAddressTooLarge(65536)) == false)
+
+@test
+fn test_a_local_refusal_and_a_line_problem_go_in_different_counters() [io]
+    test.case("mixing them makes a bad cable and a bad address look the same in a poll loop's statistics")
+    test.assert(mberr.is_local(MbCountTooLarge(3, 126, 125)))
+    test.assert(mberr.is_local(MbBadCoilValue(1)))
+    test.assert(mberr.is_local(MbBadUnitAddress(248)))
+    test.assert(mberr.is_local(MbTimedOut(1000)) == false)
+    test.assert(mberr.is_local(MbBadCrc(1, 2)) == false)
+
+@test
+fn test_waiting_for_a_reply_to_a_broadcast_has_its_own_name() [io]
+    test.case("because the answer is a code change rather than a longer timeout")
+    test.assert(mberr.is_local(MbBroadcastHasNoReply))
+    test.assert(mberr.is_retryable(MbBroadcastHasNoReply) == false)
+
+@test
+fn test_the_error_trait_and_the_free_function_agree() [io]
+    test.assert_eq(MbBroadcastHasNoReply.message(),
+                   mberr.describe(MbBroadcastHasNoReply))
+
+@test
+fn test_a_message_names_the_numbers_that_decided_it() [io]
+    test.assert(str.contains(mberr.describe(MbCountTooLarge(3, 126, 125)), "126"))
+    test.assert(str.contains(mberr.describe(MbNotInMap(60, 10)), "60"))

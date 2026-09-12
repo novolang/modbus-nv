@@ -1,0 +1,341 @@
+// mbrtu.nv — RTU framing: an address byte, a protocol data unit, a
+// CRC, and a silence.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FRAME HAS NO DELIMITER AND THAT IS THE WHOLE DIFFICULTY.  Modbus
+// RTU puts nothing at the start or the end of a frame: what separates
+// two frames on an RS-485 line is 3.5 CHARACTER TIMES OF SILENCE, and
+// a receiver that does not measure it cannot tell where one frame ends
+// and the next begins.  Every RTU implementation that "sometimes drops
+// frames under load" is one that guessed at this.
+//
+// SO THE SILENCE IS A NUMBER THIS PACKAGE ANSWERS AND THE CALLER
+// TIMES.  `silence_us` is 3.5 character times at a baud rate, with the
+// specification's own exception: at 19200 baud and above the figure is
+// FIXED at 1750 µs rather than computed, because 3.5 characters at
+// 115200 is 304 µs and no general-purpose operating system can measure
+// that reliably.  A `core` package has no clock, so it cannot wait —
+// which is exactly right here, since the thing that measures the gap
+// is a UART interrupt on a device and a serial port's inter-character
+// timeout on a host, and neither is this package's.
+//
+// THE CRC IS AN `Int` THE CALLER SUPPLIES.  crc-nv carries CRC-16/MODBUS
+// by name and `mbcrc` is the one-line bridge; every function here takes
+// the number, which is what lets a gateway with a CRC peripheral pass
+// its hardware's answer in and what keeps this module out of any
+// dependency's module closure.
+//
+// AND THE CRC GOES OUT LOW BYTE FIRST, which is the one place Modbus
+// is little-endian: the protocol data unit is big-endian throughout
+// and the two check bytes are not.  `crc_low_byte` and `crc_high_byte`
+// exist so that cannot be written the other way round by accident.
+
+use mbpdu
+
+// ── The frame ────────────────────────────────────────────────────────
+
+// The largest RTU frame: 256 bytes.
+//
+// One address byte, up to 253 of protocol data unit, and two of CRC.
+// It is the serial framing's limit and TCP inherited it, which is why
+// a Modbus TCP payload is 253 bytes rather than anything larger.
+pub const MB_RTU_MAX_FRAME = 256
+
+// How many bytes an RTU frame adds to a protocol data unit: 3.
+pub const MB_RTU_OVERHEAD = 3
+
+// The broadcast address: 0.
+//
+// A request to address 0 reaches every device on the line and NONE OF
+// THEM ANSWERS, which is the rule a client has to know before it sends
+// one: waiting for a reply to a broadcast is waiting forever, and the
+// only thing that ends it is the turnaround delay.
+pub const MB_ADDR_BROADCAST = 0
+// The lowest address a device may have: 1.
+pub const MB_ADDR_MIN = 1
+// The highest: 247.  248 to 255 are reserved, and a device configured
+// into that range is a device the specification says nothing about.
+pub const MB_ADDR_MAX = 247
+
+// How long an RTU frame carrying a protocol data unit of `pdu_len`
+// bytes is.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.frame_len(5)}")   // 8
+// ```
+pub fn frame_len(pdu_len: Int) -> Int []
+    todo("modbus-nv.mbrtu.frame_len")
+
+// How long the protocol data unit inside a frame of `frame_len` bytes
+// is.
+pub fn pdu_len(frame_len: Int) -> Int []
+    todo("modbus-nv.mbrtu.pdu_len")
+
+// Where the protocol data unit begins inside a frame: 1.
+pub fn pdu_offset() -> Int []
+    todo("modbus-nv.mbrtu.pdu_offset")
+
+// Where the CRC begins inside a frame of `frame_len` bytes.
+pub fn crc_offset(frame_len: Int) -> Int []
+    todo("modbus-nv.mbrtu.crc_offset")
+
+// The unit address a frame is addressed to, or -1 when the bytes are
+// too short to say.
+pub fn frame_address(buf: [u8], off: Int, len: Int) -> Int []
+    todo("modbus-nv.mbrtu.frame_address")
+
+// Whether an address is one a device may be configured to.
+//
+// 1 to 247.  0 is broadcast and 248 to 255 are reserved, and a device
+// in the reserved range works between two implementations that agree
+// and fails against everything else.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.address_is_valid(247)}")   // true
+//     println("${mbrtu.address_is_valid(248)}")   // false
+// ```
+pub fn address_is_valid(address: Int) -> Bool []
+    todo("modbus-nv.mbrtu.address_is_valid")
+
+// Whether an address is the broadcast address.
+pub fn is_broadcast(address: Int) -> Bool []
+    todo("modbus-nv.mbrtu.is_broadcast")
+
+// Whether a device at `address` should act on a frame addressed to
+// `to`.
+//
+// Its own address or the broadcast address, and nothing else.  A
+// device that answered a broadcast would collide with every other
+// device on the line doing the same.
+pub fn addressed_to_us(to: Int, address: Int) -> Bool []
+    todo("modbus-nv.mbrtu.addressed_to_us")
+
+// Whether a request to this address expects an answer at all.
+//
+// A broadcast does not, and a client that waited for one waits until
+// its timeout on every single write it broadcasts.
+pub fn expects_reply(address: Int) -> Bool []
+    todo("modbus-nv.mbrtu.expects_reply")
+
+// ── Building and reading a frame ─────────────────────────────────────
+
+// The `i`-th byte of an RTU frame carrying a request to `address`,
+// with the CRC the caller computed.
+//
+// The CRC goes out LOW BYTE FIRST — the one place in Modbus that is
+// little-endian, against a protocol data unit that is big-endian
+// throughout.
+//
+// ```novo
+// use mbrtu
+// use mbpdu
+//
+// fn main() [io]
+//     let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 2)
+//     println("${mbrtu.req_frame_byte(1, q, 0xC40B, 0)}")   // 1, the address
+// ```
+pub fn req_frame_byte(address: Int, q: MbReq, crc: Int, i: Int) -> Int []
+    todo("modbus-nv.mbrtu.req_frame_byte")
+
+// The `i`-th byte of an RTU frame carrying a response.
+pub fn rsp_frame_byte(address: Int, r: MbRsp, crc: Int, i: Int) -> Int []
+    todo("modbus-nv.mbrtu.rsp_frame_byte")
+
+// The low byte of a CRC, which goes out first.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.crc_low_byte(0xC40B)}")   // 11
+// ```
+pub fn crc_low_byte(crc: Int) -> Int []
+    todo("modbus-nv.mbrtu.crc_low_byte")
+
+// The high byte, which goes out second.
+pub fn crc_high_byte(crc: Int) -> Int []
+    todo("modbus-nv.mbrtu.crc_high_byte")
+
+// The CRC carried at the end of a frame, read low byte first.
+pub fn frame_crc(buf: [u8], off: Int, len: Int) -> Int []
+    todo("modbus-nv.mbrtu.frame_crc")
+
+// Whether a frame's carried CRC matches the one the caller computed
+// over everything before it.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.crc_low_byte(0x1234)}")   // 52
+// ```
+pub fn crc_ok(buf: [u8], off: Int, len: Int, computed: Int) -> Bool []
+    todo("modbus-nv.mbrtu.crc_ok")
+
+// How many bytes of a frame the CRC covers: everything but the two
+// CRC bytes themselves.
+pub fn crc_covers(frame_len: Int) -> Int []
+    todo("modbus-nv.mbrtu.crc_covers")
+
+// Why a frame cannot be acted on, or nothing.
+pub fn check_frame(buf: [u8], off: Int, len: Int, computed_crc: Int) -> ?MbError []
+    todo("modbus-nv.mbrtu.check_frame")
+
+// ── How long a frame will be ─────────────────────────────────────────
+//
+// The other half of having no delimiter: a receiver that knows the
+// function code can work out how many bytes to expect, which turns a
+// timing problem into a counting one for every frame whose length is
+// determined by its header.
+
+// How long a REQUEST frame for this function code will be, or -1 when
+// the length depends on a byte that has not arrived yet.
+//
+// A read request is always eight bytes; a multiple write is eight plus
+// its byte count, which is at offset 6 — so a receiver reads seven
+// bytes, learns the rest, and never has to time anything.  That is the
+// difference between a gateway that works at 115200 baud and one that
+// does not.
+//
+// ```novo
+// use mbrtu
+// use mbpdu
+//
+// fn main() [io]
+//     println("${mbrtu.expected_req_len(mbpdu.MB_FC_READ_HOLDING, 0)}")   // 8
+// ```
+pub fn expected_req_len(fc: Int, byte_count: Int) -> Int []
+    todo("modbus-nv.mbrtu.expected_req_len")
+
+// How long a RESPONSE frame will be, given the function code and the
+// byte count at offset 2 where the function has one.
+pub fn expected_rsp_len(fc: Int, byte_count: Int) -> Int []
+    todo("modbus-nv.mbrtu.expected_rsp_len")
+
+// How many bytes a receiver must have before it can work out the rest
+// of the frame's length, for this function code.
+//
+// Two for a read response — the function code and the byte count — and
+// seven for a multiple write request.  The number a receive state
+// machine is written around.
+pub fn header_bytes_needed(fc: Int) -> Int []
+    todo("modbus-nv.mbrtu.header_bytes_needed")
+
+// How long an exception response frame always is: 5.
+//
+// An address, the function code with its high bit set, the exception
+// code, and two of CRC.  Fixed, which is why a receiver can recognise
+// one from three bytes.
+pub const MB_RTU_EXCEPTION_FRAME_LEN = 5
+
+// Whether the byte at the function code position marks an exception
+// response, which is how a receiver knows the frame is five bytes
+// before it has counted them.
+pub fn looks_like_exception(buf: [u8], off: Int, len: Int) -> Bool []
+    todo("modbus-nv.mbrtu.looks_like_exception")
+
+// ── The silence, as a number the caller times ────────────────────────
+
+// How many bits one Modbus character occupies on the wire: 11.
+//
+// A start bit, eight data bits, a parity bit and a stop bit.  A line
+// configured 8N1 — no parity, one stop bit — still has to be timed as
+// ELEVEN bits per character rather than ten, because the
+// specification's character time is defined that way and a device that
+// computed ten is 10% impatient.
+pub const MB_BITS_PER_CHAR = 11
+
+// The baud rate at and above which the silence is a fixed 1750 µs
+// rather than a computed 3.5 characters: 19200.
+pub const MB_FIXED_SILENCE_BAUD = 19200
+
+// The fixed inter-frame silence above 19200 baud, in microseconds:
+// 1750.
+pub const MB_FIXED_SILENCE_US = 1750
+
+// The inter-frame silence at this baud rate, in microseconds.
+//
+// 3.5 character times below 19200 baud, and a FIXED 1750 µs at and
+// above it — which is the specification's own exception, and the
+// reason for it is arithmetic: 3.5 characters at 115200 baud is 304 µs
+// and nothing running an operating system can measure that reliably.
+// A device that computed it anyway either splits frames or merges
+// them, and both look like a bad cable.
+//
+// A number rather than a wait, because a `core` package has no clock —
+// and because the thing that measures the gap is a UART interrupt on a
+// device and a serial port's inter-character timeout on a host, and
+// neither is this package's.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.silence_us(9600)}")     // 4010
+//     println("${mbrtu.silence_us(115200)}")   // 1750
+// ```
+pub fn silence_us(baud: Int) -> Int []
+    todo("modbus-nv.mbrtu.silence_us")
+
+// The inter-CHARACTER timeout at this baud rate, in microseconds: 1.5
+// character times, fixed at 750 µs at and above 19200 baud.
+//
+// A different number from the inter-frame silence and a different
+// job: a gap longer than this INSIDE a frame means the frame is
+// corrupt and must be discarded, where a gap longer than the
+// inter-frame silence means the frame is over.  An implementation with
+// only one of the two timers either accepts frames with holes in them
+// or splits good ones.
+pub fn char_timeout_us(baud: Int) -> Int []
+    todo("modbus-nv.mbrtu.char_timeout_us")
+
+// How long one character takes at this baud rate, in microseconds.
+pub fn char_time_us(baud: Int) -> Int []
+    todo("modbus-nv.mbrtu.char_time_us")
+
+// How long a frame of `frame_len` bytes takes to transmit, in
+// microseconds.
+//
+// What a client's response timeout has to be larger than, and the
+// number that is forgotten: at 9600 baud a 256-byte frame takes a
+// quarter of a second to send and another quarter to answer, and a
+// client with a 100 ms timeout never sees a long reply.
+//
+// ```novo
+// use mbrtu
+//
+// fn main() [io]
+//     println("${mbrtu.transmit_us(8, 9600)}")   // 9166
+// ```
+pub fn transmit_us(frame_len: Int, baud: Int) -> Int []
+    todo("modbus-nv.mbrtu.transmit_us")
+
+// How long a client should wait for a reply to a request of
+// `req_len` bytes that will be answered with `rsp_len`, at this baud
+// rate, allowing the device `device_ms` to think.
+//
+// The arithmetic behind a timeout, rather than a number somebody
+// picked: the request's transmission, the device's own processing, the
+// response's transmission, and the two silences.  A timeout chosen
+// without it is either so short that long reads always fail or so long
+// that a dead device stalls a poll loop.
+pub fn reply_timeout_us(req_len: Int, rsp_len: Int, baud: Int, device_ms: Int) -> Int []
+    todo("modbus-nv.mbrtu.reply_timeout_us")
+
+// How long a client must wait after a BROADCAST before sending
+// anything else, in microseconds.
+//
+// Nobody answers a broadcast, so there is no reply to wait for — but
+// every device on the line is acting on it, and a request sent into
+// that window reaches a device that is busy.  The turnaround delay is
+// the only thing that separates them, and a client without one gets
+// intermittent exception 6 from whichever device was slowest.
+pub fn turnaround_us(baud: Int) -> Int []
+    todo("modbus-nv.mbrtu.turnaround_us")

@@ -1,0 +1,63 @@
+[package]
+name        = "modbus-nv"
+version     = "0.0.1"
+description = "Modbus RTU and TCP: the protocol data unit for function codes 1 to 6, 15, 16 and 23 with the per-code count limits a conforming server enforces, exceptions as responses rather than errors, RTU framing with CRC-16/MODBUS and the inter-frame silence as a number the caller times, the TCP MBAP header, a server-side address map with a handler trait, and a client over sockets.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, with one host module named below.
+#
+# The plan placed the row at `host` because the client is the visible
+# half.  The consumer that decided the layer is a GATEWAY: a
+# sensorhub-class device with an RS-485 port on one side and a radio on
+# the other, decoding a Modbus request in an interrupt on a part with
+# 64 KB of RAM.  Everything it needs — the protocol data unit, the RTU
+# framing, the address map — is arithmetic over integers the caller
+# already holds, so the narrow layer is declared and the wide module
+# named (`docs/publishing.md` § A package with a core and a host half),
+# which is what makes the device claim in `tests/embedded_probe.nv` a
+# thing the audit BUILDS.
+layer       = "core"
+
+# `mbclient` is the one module that performs: a TCP socket and the
+# clock a request timeout needs.  `[net, time]`, and nothing else — an
+# RTU client over a serial port is the caller's transport, declared
+# where that transport is.
+host_modules = ["mbclient"]
+
+category    = "embedded"
+
+tags        = ["modbus", "modbus-rtu", "modbus-tcp", "rs485", "plc", "scada", "gateway", "embedded"]
+repository  = "https://github.com/novolang/modbus-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Modbus, with the exception as a reply rather than a fault"
+
+[dependencies]
+# crc-nv, for CRC-16/MODBUS.
+#
+# THE PACKAGE CARRIES THAT EXACT ALGORITHM, by name: `crc16_modbus()`
+# is polynomial 0x8005 reflected, initialised to 0xffff, with no final
+# xor, and its published check value over the nine bytes `123456789` is
+# 0x4b37 — which is the number that says a CRC implementation is the
+# right variant rather than a plausible one.  Writing a second copy of
+# it here would be two implementations of one polynomial in one
+# registry.
+#
+# It is named only by `mbcrc`, which is not in the device probe: every
+# other module takes and answers a CRC as an `Int`, so a gateway whose
+# microcontroller has a CRC peripheral passes its hardware's answer in,
+# and the probe's module closure stays inside this package's own
+# sources.
+crc-nv = "^0.1.4"

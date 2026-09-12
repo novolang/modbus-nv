@@ -1,0 +1,292 @@
+// mbpdu_tests.nv — the protocol data unit: the per-code limits, the
+// byte counts, and the exception that is a response.
+//
+// RED ON PURPOSE: every assertion against a FUNCTION reaches
+// `not implemented: modbus-nv.mbpdu.<fn>`, because every body under
+// `src/` is a `todo()`.  Assertions against published CONSTANTS pass,
+// because a constant is not a stub.
+//
+// THE VECTORS ARE THE MODBUS APPLICATION PROTOCOL SPECIFICATION
+// V1.1b3's OWN TABLES.  The quantity limits are stated per function
+// code in §§ 6.1 to 6.12 — 2000 coils, 125 registers, 1968, 123, and
+// 125 read with 121 write for function 23; the exception codes are
+// table 5; and the example frames in each section are where the
+// byte-level assertions come from.  `01 03 00 00 00 0A` is § 6.3's
+// own example of a ten-register read.
+
+use std.test
+use mbpdu
+
+// Whether a check refused.  An optional is matched rather than
+// compared, so the two-line helper is what every assertion below
+// goes through.
+fn refused(e: ?MbError) -> Bool
+    match e
+        Some(_) => true
+        None    => false
+
+@test
+fn test_the_quantity_limits_are_the_specifications_own_numbers() [io]
+    test.case("a request past its limit gets exception 3 from a conforming server and silence from a bad one, and either way the round trip is wasted")
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_READ_COILS), 2000)
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_READ_DISCRETE_INPUTS), 2000)
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_READ_HOLDING), 125)
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_READ_INPUT), 125)
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_WRITE_MULTIPLE_COILS), 1968)
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_WRITE_MULTIPLE_HOLDING), 123)
+
+    test.case("and function 23 has two limits, because the read and the write are in different packets with the same ceiling")
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_READ_WRITE_MULTIPLE), 125)
+    test.assert_eq(mbpdu.max_write_count(mbpdu.MB_FC_READ_WRITE_MULTIPLE), 121)
+
+    test.case("a code with no quantity answers -1 rather than a plausible number")
+    test.assert_eq(mbpdu.max_count(mbpdu.MB_FC_WRITE_SINGLE_COIL), 0 - 1)
+
+@test
+fn test_the_pdu_ceiling_came_from_the_serial_framing() [io]
+    test.case("256 minus an address byte and two CRC bytes, inherited by TCP, which is why a Modbus TCP payload is 253 and not 65535")
+    test.assert_eq(mbpdu.MB_MAX_PDU_LEN, 253)
+
+@test
+fn test_a_read_request_is_five_big_endian_bytes() [io]
+    test.case("the specification's section 6.3 example: function 3, address 0, ten registers")
+    let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 10)
+    test.assert_eq(mbpdu.req_len(q), 5)
+    test.assert_eq(mbpdu.req_byte(q, 0), 0x03)
+    test.assert_eq(mbpdu.req_byte(q, 1), 0x00)
+    test.assert_eq(mbpdu.req_byte(q, 2), 0x00)
+    test.assert_eq(mbpdu.req_byte(q, 3), 0x00)
+    test.assert_eq(mbpdu.req_byte(q, 4), 0x0A)
+
+    test.case("big-endian, which is the opposite of nearly every other protocol in this project")
+    let high = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0x1234, 1)
+    test.assert_eq(mbpdu.req_byte(high, 1), 0x12)
+    test.assert_eq(mbpdu.req_byte(high, 2), 0x34)
+
+@test
+fn test_the_last_address_is_computed_once() [io]
+    test.case("the off-by-one whose symptom is exception 2 on the last address of a valid range")
+    test.assert_eq(mbpdu.req_last(mbpdu.read_req(3, 0, 10)), 9)
+    test.assert_eq(mbpdu.req_last(mbpdu.read_req(3, 100, 1)), 100)
+    test.assert_eq(mbpdu.req_last(mbpdu.read_req(3, 40, 25)), 64)
+
+@test
+fn test_a_count_past_the_limit_is_refused_before_it_is_sent() [io]
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 0, 126))))
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 0, 125))) == false)
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(1, 0, 2001))))
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(1, 0, 2000))) == false)
+
+    test.case("and a server would answer exception 3 to the same request, which is the other half of the same table")
+    test.assert_eq(mbpdu.exception_for(mbpdu.read_req(3, 0, 126)),
+                   mbpdu.MB_EX_ILLEGAL_DATA_VALUE)
+    test.assert_eq(mbpdu.exception_for(mbpdu.read_req(3, 0, 10)), 0)
+
+@test
+fn test_a_count_of_zero_is_refused() [io]
+    test.case("reading nothing is not a request the protocol has, and a server that accepted one answers a byte count of 0 that nothing can interpret")
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 0, 0))))
+
+@test
+fn test_an_address_above_sixty_five_thousand_is_not_addressable() [io]
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 65536, 1))))
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 65535, 1))) == false)
+
+    test.case("and a range that RUNS OFF the top is refused too, which a check on the start alone would miss")
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(3, 65530, 10))))
+
+@test
+fn test_an_unsupported_function_code_is_refused_with_exception_one() [io]
+    test.assert(mbpdu.is_supported(mbpdu.MB_FC_READ_WRITE_MULTIPLE))
+    test.assert(mbpdu.is_supported(99) == false)
+    test.assert(refused(mbpdu.check_req(mbpdu.read_req(99, 0, 1))))
+    test.assert_eq(mbpdu.exception_for(mbpdu.read_req(99, 0, 1)),
+                   mbpdu.MB_EX_ILLEGAL_FUNCTION)
+
+@test
+fn test_a_single_coil_write_carries_one_of_two_values_and_nothing_else() [io]
+    test.case("a device that receives 0x0001 for on is REQUIRED to refuse it, which surprises everybody exactly once")
+    test.assert_eq(mbpdu.MB_COIL_ON, 0xFF00)
+    test.assert_eq(mbpdu.MB_COIL_OFF, 0x0000)
+    test.assert(mbpdu.coil_is_on(mbpdu.MB_COIL_ON))
+    test.assert(mbpdu.coil_is_on(mbpdu.MB_COIL_OFF) == false)
+    test.assert(mbpdu.coil_value_ok(mbpdu.MB_COIL_ON))
+    test.assert(mbpdu.coil_value_ok(mbpdu.MB_COIL_OFF))
+    test.assert(mbpdu.coil_value_ok(1) == false)
+    test.assert(mbpdu.coil_value_ok(0xFF01) == false)
+
+    test.assert(refused(mbpdu.check_req(
+        mbpdu.write_single_req(mbpdu.MB_FC_WRITE_SINGLE_COIL, 0, 1))))
+
+@test
+fn test_bits_and_words_are_counted_differently() [io]
+    test.case("bits pack eight to a byte and round up; words take two each — and a client that read a coil response as registers gets plausible numbers")
+    test.assert(mbpdu.is_bit_function(mbpdu.MB_FC_READ_COILS))
+    test.assert(mbpdu.is_bit_function(mbpdu.MB_FC_READ_DISCRETE_INPUTS))
+    test.assert(mbpdu.is_bit_function(mbpdu.MB_FC_READ_HOLDING) == false)
+
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(1, 0, 1)), 1)
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(1, 0, 8)), 1)
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(1, 0, 9)), 2)
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(1, 0, 2000)), 250)
+
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(3, 0, 1)), 2)
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(3, 0, 10)), 20)
+    test.assert_eq(mbpdu.expected_byte_count(mbpdu.read_req(3, 0, 125)), 250)
+
+@test
+fn test_an_exception_is_a_response_and_not_an_error() [io]
+    test.case("THE POINT OF THIS PACKAGE: the server received the request, understood it, and refused it — which is a completely different instruction from a timeout")
+    let ex = mbpdu.exception_rsp(mbpdu.MB_FC_READ_HOLDING,
+                                 mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+    test.assert(mbpdu.rsp_is_exception(ex))
+    test.assert_eq(mbpdu.rsp_exception(ex), mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+
+    test.case("and the function code comes back with its high bit set")
+    test.assert_eq(mbpdu.MB_EXCEPTION_FLAG, 0x80)
+    test.assert_eq(mbpdu.rsp_byte(ex, 0), 0x83)
+    test.assert_eq(mbpdu.rsp_byte(ex, 1), mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+    test.assert_eq(mbpdu.rsp_len(ex), 2)
+
+    test.case("but rsp_fc answers the code WITHOUT the flag, so a dispatch is one comparison")
+    test.assert_eq(mbpdu.rsp_fc(ex), mbpdu.MB_FC_READ_HOLDING)
+
+@test
+fn test_an_ordinary_response_is_not_an_exception() [io]
+    let ok = mbpdu.read_rsp(mbpdu.MB_FC_READ_HOLDING, 20)
+    test.assert(mbpdu.rsp_is_exception(ok) == false)
+    test.assert_eq(mbpdu.rsp_exception(ok), 0)
+    test.assert_eq(mbpdu.rsp_byte_count(ok), 20)
+    test.assert_eq(mbpdu.rsp_byte(ok, 0), mbpdu.MB_FC_READ_HOLDING)
+    test.assert_eq(mbpdu.rsp_byte(ok, 1), 20)
+
+@test
+fn test_an_exception_response_still_answers_its_request() [io]
+    test.case("a client that treated an exception as a mismatch would report a protocol fault where the server was being perfectly clear")
+    let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 10)
+    let ex = mbpdu.exception_rsp(mbpdu.MB_FC_READ_HOLDING,
+                                 mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+    test.assert(mbpdu.rsp_matches(ex, q))
+    test.assert(refused(mbpdu.check_rsp(ex, q)) == false)
+
+    test.case("a reply to a different function code does not")
+    let wrong = mbpdu.read_rsp(mbpdu.MB_FC_READ_INPUT, 20)
+    test.assert(mbpdu.rsp_matches(wrong, q) == false)
+    test.assert(refused(mbpdu.check_rsp(wrong, q)))
+
+@test
+fn test_a_byte_count_that_does_not_follow_from_the_request_is_refused() [io]
+    test.case("the check that catches a device answering the wrong function's data, which otherwise reads as plausible numbers")
+    let q = mbpdu.read_req(mbpdu.MB_FC_READ_HOLDING, 0, 10)
+    test.assert(refused(mbpdu.check_rsp(mbpdu.read_rsp(3, 18), q)))
+    test.assert(refused(mbpdu.check_rsp(mbpdu.read_rsp(3, 20), q)) == false)
+
+@test
+fn test_a_write_response_echoes_rather_than_acknowledges() [io]
+    test.case("a client that compares them catches a gateway that rewrote an address, which is otherwise silent")
+    let q = mbpdu.write_single_req(mbpdu.MB_FC_WRITE_SINGLE_HOLDING, 7, 0x1234)
+    let r = mbpdu.write_rsp(mbpdu.MB_FC_WRITE_SINGLE_HOLDING, 7, 0x1234)
+    test.assert_eq(mbpdu.rsp_start(r), 7)
+    test.assert_eq(mbpdu.rsp_value(r), 0x1234)
+    test.assert(mbpdu.rsp_matches(r, q))
+
+    let moved = mbpdu.write_rsp(mbpdu.MB_FC_WRITE_SINGLE_HOLDING, 8, 0x1234)
+    test.assert(mbpdu.rsp_matches(moved, q) == false)
+
+@test
+fn test_function_twenty_three_reads_first() [io]
+    test.case("the specification's own rule, and the one thing about this function that has to be agreed — a client expecting the written values back reads what was there before")
+    let q = mbpdu.read_write_req(0, 10, 100, 5)
+    test.assert_eq(mbpdu.req_fc(q), mbpdu.MB_FC_READ_WRITE_MULTIPLE)
+    test.assert_eq(mbpdu.req_start(q), 0)
+    test.assert_eq(mbpdu.req_count(q), 10)
+    test.assert_eq(mbpdu.req_write_start(q), 100)
+    test.assert_eq(mbpdu.req_write_count(q), 5)
+
+    test.case("and the response carries the READ data, so its byte count follows the read quantity")
+    test.assert_eq(mbpdu.expected_byte_count(q), 20)
+
+@test
+fn test_function_twenty_threes_write_limit_is_checked_separately() [io]
+    test.assert(refused(mbpdu.check_req(mbpdu.read_write_req(0, 125, 100, 121))) == false)
+    test.assert(refused(mbpdu.check_req(mbpdu.read_write_req(0, 125, 100, 122))))
+    test.assert(refused(mbpdu.check_req(mbpdu.read_write_req(0, 126, 100, 121))))
+
+@test
+fn test_a_busy_device_is_not_a_broken_one() [io]
+    test.case("a client that treats a busy device as a permanent refusal gives up on one that was about to be ready")
+    test.assert(mbpdu.exception_is_transient(mbpdu.MB_EX_SERVER_BUSY))
+    test.assert(mbpdu.exception_is_transient(mbpdu.MB_EX_ACKNOWLEDGE))
+    test.assert(mbpdu.exception_is_transient(mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS) == false)
+    test.assert(mbpdu.exception_is_transient(mbpdu.MB_EX_ILLEGAL_FUNCTION) == false)
+
+@test
+fn test_the_gateway_exception_codes_exist_so_a_timeout_can_be_forwarded() [io]
+    test.case("a gateway whose device did not answer says so as an exception rather than inventing a timeout its own client then retries")
+    test.assert_eq(mbpdu.MB_EX_GATEWAY_PATH, 10)
+    test.assert_eq(mbpdu.MB_EX_GATEWAY_TARGET, 11)
+    test.assert(str.len(mbpdu.exception_name(mbpdu.MB_EX_GATEWAY_TARGET)) > 0)
+
+@test
+fn test_the_exception_codes_are_the_specifications_numbers() [io]
+    test.assert_eq(mbpdu.MB_EX_ILLEGAL_FUNCTION, 1)
+    test.assert_eq(mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS, 2)
+    test.assert_eq(mbpdu.MB_EX_ILLEGAL_DATA_VALUE, 3)
+    test.assert_eq(mbpdu.MB_EX_SERVER_FAILURE, 4)
+    test.assert_eq(mbpdu.MB_EX_ACKNOWLEDGE, 5)
+    test.assert_eq(mbpdu.MB_EX_SERVER_BUSY, 6)
+
+@test
+fn test_every_code_has_a_name_and_the_names_are_distinguishable() [io]
+    test.assert(str.len(mbpdu.exception_name(mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)) > 0)
+    test.assert(str.len(mbpdu.function_name(mbpdu.MB_FC_READ_HOLDING)) > 0)
+    test.assert(mbpdu.exception_name(mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+                != mbpdu.exception_name(mbpdu.MB_EX_ILLEGAL_DATA_VALUE))
+    test.assert(mbpdu.function_name(mbpdu.MB_FC_READ_HOLDING)
+                != mbpdu.function_name(mbpdu.MB_FC_READ_INPUT))
+
+@test
+fn test_a_request_decodes_back_from_its_bytes() [io]
+    let wire: [u8] = [0x03 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8, 0x0A as u8]
+    let q = mbpdu.req_decode(wire, 0, 5)
+    test.assert_eq(mbpdu.req_fc(q), mbpdu.MB_FC_READ_HOLDING)
+    test.assert_eq(mbpdu.req_start(q), 0)
+    test.assert_eq(mbpdu.req_count(q), 10)
+
+@test
+fn test_a_response_decodes_back_and_an_exception_is_recognised() [io]
+    let wire: [u8] = [0x83 as u8, 0x02 as u8]
+    let r = mbpdu.rsp_decode(wire, 0, 2)
+    test.assert(mbpdu.rsp_is_exception(r))
+    test.assert_eq(mbpdu.rsp_fc(r), mbpdu.MB_FC_READ_HOLDING)
+    test.assert_eq(mbpdu.rsp_exception(r), mbpdu.MB_EX_ILLEGAL_DATA_ADDRESS)
+
+@test
+fn test_a_multiple_write_header_says_where_its_data_begins() [io]
+    let q = mbpdu.write_multiple_req(mbpdu.MB_FC_WRITE_MULTIPLE_HOLDING, 0, 2)
+    test.assert_eq(mbpdu.req_header_len(q), 6)
+    test.assert_eq(mbpdu.req_byte(q, 5), 4)
+
+    let r = mbpdu.read_rsp(mbpdu.MB_FC_READ_HOLDING, 20)
+    test.assert_eq(mbpdu.rsp_header_len(r), 2)
+
+@test
+fn test_which_codes_read_and_which_write() [io]
+    test.case("function 23 does both, which is why the two questions are separate rather than one enum")
+    test.assert(mbpdu.is_read_function(mbpdu.MB_FC_READ_HOLDING))
+    test.assert(mbpdu.is_read_function(mbpdu.MB_FC_WRITE_SINGLE_COIL) == false)
+    test.assert(mbpdu.is_write_function(mbpdu.MB_FC_WRITE_SINGLE_COIL))
+    test.assert(mbpdu.is_write_function(mbpdu.MB_FC_WRITE_MULTIPLE_HOLDING))
+    test.assert(mbpdu.is_write_function(mbpdu.MB_FC_READ_HOLDING) == false)
+
+    test.assert(mbpdu.is_read_function(mbpdu.MB_FC_READ_WRITE_MULTIPLE))
+    test.assert(mbpdu.is_write_function(mbpdu.MB_FC_READ_WRITE_MULTIPLE))
+
+@test
+fn test_a_single_write_carries_its_value_where_a_read_carries_a_count() [io]
+    test.case("one record for nine function codes, so the fields mean different things per code and req_value is the one a single write uses")
+    let w = mbpdu.write_single_req(mbpdu.MB_FC_WRITE_SINGLE_HOLDING, 7, 0x1234)
+    test.assert_eq(mbpdu.req_start(w), 7)
+    test.assert_eq(mbpdu.req_value(w), 0x1234)
+    test.assert_eq(mbpdu.req_byte(w, 3), 0x12)
+    test.assert_eq(mbpdu.req_byte(w, 4), 0x34)
