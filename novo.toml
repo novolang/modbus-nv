@@ -1,6 +1,6 @@
 [package]
 name        = "modbus-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Modbus RTU and TCP: the protocol data unit for function codes 1 to 6, 15, 16 and 23 with the per-code count limits a conforming server enforces, exceptions as responses rather than errors, RTU framing with CRC-16/MODBUS and the inter-frame silence as a number the caller times, the TCP MBAP header, a server-side address map with a handler trait, and a client over sockets.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
